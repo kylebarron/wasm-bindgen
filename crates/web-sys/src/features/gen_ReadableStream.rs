@@ -1,4 +1,5 @@
 #![allow(unused_imports)]
+#![allow(clippy::all)]
 use super::*;
 use wasm_bindgen::prelude::*;
 #[wasm_bindgen]
@@ -112,7 +113,6 @@ extern "C" {
         transform: &ReadableWritablePair,
         options: &StreamPipeOptions,
     ) -> ReadableStream;
-    #[cfg(web_sys_unstable_apis)]
     #[cfg(feature = "WritableStream")]
     # [wasm_bindgen (method , structural , js_class = "ReadableStream" , js_name = pipeTo)]
     #[doc = "The `pipeTo()` method."]
@@ -120,11 +120,7 @@ extern "C" {
     #[doc = "[MDN Documentation](https://developer.mozilla.org/en-US/docs/Web/API/ReadableStream/pipeTo)"]
     #[doc = ""]
     #[doc = "*This API requires the following crate features to be activated: `ReadableStream`, `WritableStream`*"]
-    #[doc = ""]
-    #[doc = "*This API is unstable and requires `--cfg=web_sys_unstable_apis` to be activated, as"]
-    #[doc = "[described in the `wasm-bindgen` guide](https://rustwasm.github.io/docs/wasm-bindgen/web-sys/unstable-apis.html)*"]
     pub fn pipe_to(this: &ReadableStream, destination: &WritableStream) -> ::js_sys::Promise;
-    #[cfg(web_sys_unstable_apis)]
     #[cfg(all(feature = "StreamPipeOptions", feature = "WritableStream",))]
     # [wasm_bindgen (method , structural , js_class = "ReadableStream" , js_name = pipeTo)]
     #[doc = "The `pipeTo()` method."]
@@ -132,9 +128,6 @@ extern "C" {
     #[doc = "[MDN Documentation](https://developer.mozilla.org/en-US/docs/Web/API/ReadableStream/pipeTo)"]
     #[doc = ""]
     #[doc = "*This API requires the following crate features to be activated: `ReadableStream`, `StreamPipeOptions`, `WritableStream`*"]
-    #[doc = ""]
-    #[doc = "*This API is unstable and requires `--cfg=web_sys_unstable_apis` to be activated, as"]
-    #[doc = "[described in the `wasm-bindgen` guide](https://rustwasm.github.io/docs/wasm-bindgen/web-sys/unstable-apis.html)*"]
     pub fn pipe_to_with_options(
         this: &ReadableStream,
         destination: &WritableStream,

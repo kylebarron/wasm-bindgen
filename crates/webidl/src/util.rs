@@ -7,17 +7,15 @@ use std::ptr;
 use heck::{CamelCase, ShoutySnakeCase, SnakeCase};
 use proc_macro2::{Ident, TokenStream};
 use quote::quote;
-use syn;
 use wasm_bindgen_backend::util::{ident_ty, raw_ident, rust_ident};
-use weedle;
 use weedle::attribute::{ExtendedAttribute, ExtendedAttributeList, IdentifierOrString};
 use weedle::common::Identifier;
-use weedle::literal::{ConstValue, FloatLit, IntegerLit};
-use weedle::types::{NonAnyType, SingleType};
+use weedle::literal::{ConstValue as ConstValueLit, FloatLit, IntegerLit};
+use weedle::types::{MayBeNull, NonAnyType, SingleType};
 
-use crate::constants::IMMUTABLE_SLICE_WHITELIST;
+use crate::constants::{FIXED_INTERFACES, IMMUTABLE_SLICE_WHITELIST};
 use crate::first_pass::{FirstPassRecord, OperationData, OperationId, Signature};
-use crate::generator::{InterfaceConstValue, InterfaceMethod, InterfaceMethodKind};
+use crate::generator::{ConstValue, InterfaceMethod, InterfaceMethodKind};
 use crate::idl_type::{IdlType, ToIdlType};
 use crate::Options;
 
@@ -87,7 +85,7 @@ pub fn mdn_doc(class: &str, method: Option<&str>) -> String {
     if let Some(method) = method {
         link.push_str(&format!("/{}", method));
     }
-    format!("[MDN Documentation]({})", link).into()
+    format!("[MDN Documentation]({})", link)
 }
 
 // Array type is borrowed for arguments (`&mut [T]` or `&[T]`) and owned for return value (`Vec<T>`).
@@ -104,28 +102,24 @@ pub(crate) fn array(base_ty: &str, pos: TypePosition, immutable: bool) -> syn::T
 }
 
 /// Map a webidl const value to the correct wasm-bindgen const value
-pub fn webidl_const_v_to_backend_const_v(v: &ConstValue) -> InterfaceConstValue {
+pub fn webidl_const_v_to_backend_const_v(v: &ConstValueLit) -> ConstValue {
     use std::f64::{INFINITY, NAN, NEG_INFINITY};
 
     match *v {
-        ConstValue::Boolean(b) => InterfaceConstValue::BooleanLiteral(b.0),
-        ConstValue::Float(FloatLit::NegInfinity(_)) => {
-            InterfaceConstValue::FloatLiteral(NEG_INFINITY)
-        }
-        ConstValue::Float(FloatLit::Infinity(_)) => InterfaceConstValue::FloatLiteral(INFINITY),
-        ConstValue::Float(FloatLit::NaN(_)) => InterfaceConstValue::FloatLiteral(NAN),
-        ConstValue::Float(FloatLit::Value(s)) => {
-            InterfaceConstValue::FloatLiteral(s.0.parse().unwrap())
-        }
-        ConstValue::Integer(lit) => {
+        ConstValueLit::Boolean(b) => ConstValue::Boolean(b.0),
+        ConstValueLit::Float(FloatLit::NegInfinity(_)) => ConstValue::Float(NEG_INFINITY),
+        ConstValueLit::Float(FloatLit::Infinity(_)) => ConstValue::Float(INFINITY),
+        ConstValueLit::Float(FloatLit::NaN(_)) => ConstValue::Float(NAN),
+        ConstValueLit::Float(FloatLit::Value(s)) => ConstValue::Float(s.0.parse().unwrap()),
+        ConstValueLit::Integer(lit) => {
             let mklit = |orig_text: &str, base: u32, offset: usize| {
-                let (negative, text) = if orig_text.starts_with("-") {
-                    (true, &orig_text[1..])
+                let (negative, text) = if let Some(text) = orig_text.strip_prefix('-') {
+                    (true, text)
                 } else {
                     (false, orig_text)
                 };
                 if text == "0" {
-                    return InterfaceConstValue::SignedIntegerLiteral(0);
+                    return ConstValue::SignedInteger(0);
                 }
                 let text = &text[offset..];
                 let n = u64::from_str_radix(text, base)
@@ -136,9 +130,9 @@ pub fn webidl_const_v_to_backend_const_v(v: &ConstValue) -> InterfaceConstValue 
                     } else {
                         n.wrapping_neg() as i64
                     };
-                    InterfaceConstValue::SignedIntegerLiteral(n)
+                    ConstValue::SignedInteger(n)
                 } else {
-                    InterfaceConstValue::UnsignedIntegerLiteral(n)
+                    ConstValue::UnsignedInteger(n)
                 }
             };
             match lit {
@@ -147,7 +141,7 @@ pub fn webidl_const_v_to_backend_const_v(v: &ConstValue) -> InterfaceConstValue 
                 IntegerLit::Dec(h) => mklit(h.0, 10, 0),
             }
         }
-        ConstValue::Null(_) => unimplemented!(),
+        ConstValueLit::Null(_) => unimplemented!(),
     }
 }
 
@@ -344,10 +338,10 @@ impl<'src> FirstPassRecord<'src> {
                 let mut any_different = false;
                 let arg_name = signature.orig.args[i].name;
                 for other in actual_signatures.iter() {
-                    if other.orig.args.get(i).map(|s| s.name) == Some(arg_name) {
-                        if !ptr::eq(signature, other) {
-                            any_same_name = true;
-                        }
+                    if other.orig.args.get(i).map(|s| s.name) == Some(arg_name)
+                        && !ptr::eq(signature, other)
+                    {
+                        any_same_name = true;
                     }
                     if let Some(other) = other.args.get(i) {
                         if other != arg {
@@ -388,13 +382,13 @@ impl<'src> FirstPassRecord<'src> {
             }
             let structural =
                 force_structural || is_structural(signature.orig.attrs.as_ref(), container_attrs);
-            let catch = force_throws || throws(&signature.orig.attrs);
+            let catch = force_throws || throws(signature.orig.attrs);
             let ret_ty = if id == &OperationId::IndexingGetter {
                 // All indexing getters should return optional values (or
                 // otherwise be marked with catch).
                 match ret_ty {
                     IdlType::Nullable(_) => ret_ty,
-                    ref ty @ _ => {
+                    ref ty => {
                         if catch {
                             ret_ty
                         } else {
@@ -443,15 +437,17 @@ impl<'src> FirstPassRecord<'src> {
             // Stable types can have methods that have unstable argument types.
             // If any of the arguments types are `unstable` then this method is downgraded
             // to be unstable.
-            let unstable_override = match unstable {
-                // only downgrade stable methods
-                false => signature
-                    .orig
+            let has_unstable_args = signature
+                .orig
+                .args
+                .iter()
+                .any(|arg| is_type_unstable(arg.ty, unstable_types))
+                | signature
                     .args
                     .iter()
-                    .any(|arg| is_type_unstable(arg.ty, unstable_types)),
-                true => true,
-            };
+                    .any(|arg| is_idl_type_unstable(arg, unstable_types));
+
+            let unstable = unstable || data.stability.is_unstable() || has_unstable_args;
 
             if let Some(arguments) = arguments {
                 if let Ok(ret_ty) = ret_ty.to_syn_type(TypePosition::Return) {
@@ -465,7 +461,7 @@ impl<'src> FirstPassRecord<'src> {
                         structural,
                         catch,
                         variadic,
-                        unstable: unstable_override,
+                        unstable,
                     });
                 }
             }
@@ -496,13 +492,20 @@ impl<'src> FirstPassRecord<'src> {
                             structural,
                             catch,
                             variadic: false,
-                            unstable: unstable_override,
+                            unstable,
                         });
                     }
                 }
             }
         }
-        return ret;
+
+        for interface in &mut ret {
+            if let Some(fixed) = FIXED_INTERFACES.get(&interface.name.to_string().as_ref()) {
+                interface.name = rust_ident(fixed);
+            }
+        }
+
+        ret
     }
 
     /// When generating our web_sys APIs we default to setting slice references that
@@ -536,6 +539,13 @@ pub fn is_type_unstable(ty: &weedle::types::Type, unstable_types: &HashSet<Ident
             // Check if the type in the unstable type list
             unstable_types.contains(&i.type_)
         }
+        _ => false,
+    }
+}
+
+fn is_idl_type_unstable(ty: &IdlType, unstable_types: &HashSet<Identifier>) -> bool {
+    match ty {
+        IdlType::Interface(name) => unstable_types.contains(&Identifier(name)),
         _ => false,
     }
 }
@@ -643,7 +653,7 @@ fn flag_slices_immutable(ty: &mut IdlType) {
 }
 
 pub fn required_doc_string(options: &Options, features: &BTreeSet<String>) -> Option<String> {
-    if !options.features || features.len() == 0 {
+    if !options.features || features.is_empty() {
         return None;
     }
     let list = features
@@ -665,7 +675,7 @@ pub fn get_cfg_features(options: &Options, features: &BTreeSet<String>) -> Optio
         None
     } else {
         let features = features
-            .into_iter()
+            .iter()
             .map(|feature| quote!( feature = #feature, ))
             .collect::<TokenStream>();
 
@@ -676,4 +686,47 @@ pub fn get_cfg_features(options: &Options, features: &BTreeSet<String>) -> Optio
             Some(syn::parse_quote!( #[cfg(all(#features))] ))
         }
     }
+}
+
+pub fn nullable(mut ty: weedle::types::Type) -> weedle::types::Type {
+    use weedle::types::Type;
+
+    fn make_nullable<T>(mb: &mut MayBeNull<T>) {
+        mb.q_mark = Some(weedle::term::QMark);
+    }
+
+    match &mut ty {
+        Type::Single(SingleType::Any(_) | SingleType::NonAny(NonAnyType::Promise(_))) => (),
+        Type::Single(SingleType::NonAny(NonAnyType::Integer(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::FloatingPoint(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::Boolean(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::Byte(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::Octet(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::ByteString(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::DOMString(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::USVString(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::Sequence(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::Object(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::Symbol(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::Error(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::ArrayBuffer(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::DataView(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::Int8Array(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::Int16Array(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::Int32Array(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::Uint8Array(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::Uint16Array(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::Uint32Array(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::Uint8ClampedArray(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::Float32Array(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::Float64Array(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::ArrayBufferView(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::BufferSource(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::FrozenArrayType(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::RecordType(mb))) => make_nullable(mb),
+        Type::Single(SingleType::NonAny(NonAnyType::Identifier(mb))) => make_nullable(mb),
+        Type::Union(mb) => make_nullable(mb),
+    }
+
+    ty
 }

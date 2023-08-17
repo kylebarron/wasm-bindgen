@@ -8,7 +8,8 @@ use crate::js::Context;
 use crate::wit::InstructionData;
 use crate::wit::{Adapter, AdapterId, AdapterKind, AdapterType, Instruction};
 use anyhow::{anyhow, bail, Error};
-use walrus::Module;
+use std::fmt::Write;
+use walrus::{Module, ValType};
 
 /// A one-size-fits-all builder for processing WebIDL bindings and generating
 /// JS.
@@ -39,6 +40,9 @@ pub struct JsBuilder<'a, 'b> {
     /// built so far.
     prelude: String,
 
+    /// Code which should go before the `try {` in a try-finally block.
+    pre_try: String,
+
     /// JS code to execute in a `finally` block in case any exceptions happen.
     finally: String,
 
@@ -64,6 +68,9 @@ pub struct JsFunction {
     pub js_doc: String,
     pub ts_arg_tys: Vec<String>,
     pub ts_ret_ty: Option<String>,
+    /// Whether this function has a single optional argument.
+    ///
+    /// If the function is a setter, that means that the field it sets is optional.
     pub might_be_optional_field: bool,
     pub catch: bool,
     pub log_error: bool,
@@ -102,6 +109,8 @@ impl<'a, 'b> Builder<'a, 'b> {
         instructions: &[InstructionData],
         explicit_arg_names: &Option<Vec<String>>,
         asyncness: bool,
+        variadic: bool,
+        generate_jsdoc: bool,
     ) -> Result<JsFunction, Error> {
         if self
             .cx
@@ -120,22 +129,19 @@ impl<'a, 'b> Builder<'a, 'b> {
         // method, so the leading parameter is the this pointer stored on
         // the JS object, so synthesize that here.
         let mut js = JsBuilder::new(self.cx);
-        match self.method {
-            Some(consumes_self) => {
-                drop(params.next());
-                if js.cx.config.debug {
-                    js.prelude(
-                        "if (this.ptr == 0) throw new Error('Attempt to use a moved value');",
-                    );
-                }
-                if consumes_self {
-                    js.prelude("const ptr = this.__destroy_into_raw();");
-                    js.args.push("ptr".into());
-                } else {
-                    js.args.push("this.ptr".into());
-                }
+        if let Some(consumes_self) = self.method {
+            let _ = params.next();
+            if js.cx.config.debug {
+                js.prelude(
+                    "if (this.__wbg_ptr == 0) throw new Error('Attempt to use a moved value');",
+                );
             }
-            None => {}
+            if consumes_self {
+                js.prelude("const ptr = this.__destroy_into_raw();");
+                js.args.push("ptr".into());
+            } else {
+                js.args.push("this.__wbg_ptr".into());
+            }
         }
         for (i, param) in params.enumerate() {
             let arg = match explicit_arg_names {
@@ -192,14 +198,28 @@ impl<'a, 'b> Builder<'a, 'b> {
         // }
 
         let mut code = String::new();
-        code.push_str("(");
-        code.push_str(&function_args.join(", "));
+        code.push('(');
+        if variadic {
+            if let Some((last, non_variadic_args)) = function_args.split_last() {
+                code.push_str(&non_variadic_args.join(", "));
+                if !non_variadic_args.is_empty() {
+                    code.push_str(", ");
+                }
+                code.push_str((String::from("...") + last).as_str())
+            }
+        } else {
+            code.push_str(&function_args.join(", "));
+        }
         code.push_str(") {\n");
 
-        let mut call = js.prelude;
-        if js.finally.len() != 0 {
-            call = format!("try {{\n{}}} finally {{\n{}}}\n", call, js.finally);
-        }
+        let call = if !js.finally.is_empty() {
+            format!(
+                "{}try {{\n{}}} finally {{\n{}}}\n",
+                js.pre_try, js.prelude, js.finally
+            )
+        } else {
+            js.pre_try + &js.prelude
+        };
 
         if self.catch {
             js.cx.expose_handle_error()?;
@@ -214,7 +234,7 @@ impl<'a, 'b> Builder<'a, 'b> {
         }
 
         code.push_str(&call);
-        code.push_str("}");
+        code.push('}');
 
         // Rust Structs' fields converted into Getter and Setter functions before
         // we decode them from webassembly, finding if a function is a field
@@ -227,8 +247,14 @@ impl<'a, 'b> Builder<'a, 'b> {
             &adapter.inner_results,
             &mut might_be_optional_field,
             asyncness,
+            variadic,
         );
-        let js_doc = self.js_doc_comments(&function_args, &arg_tys, &ts_ret_ty);
+        let js_doc = if generate_jsdoc {
+            self.js_doc_comments(&function_args, &arg_tys, &ts_ret_ty, variadic)
+        } else {
+            String::new()
+        };
+
         Ok(JsFunction {
             code,
             ts_sig,
@@ -253,6 +279,7 @@ impl<'a, 'b> Builder<'a, 'b> {
         result_tys: &[AdapterType],
         might_be_optional_field: &mut bool,
         asyncness: bool,
+        variadic: bool,
     ) -> (String, Vec<String>, Option<String>) {
         // Build up the typescript signature as well
         let mut omittable = true;
@@ -283,7 +310,19 @@ impl<'a, 'b> Builder<'a, 'b> {
         }
         ts_args.reverse();
         ts_arg_tys.reverse();
-        let mut ts = format!("({})", ts_args.join(", "));
+        let mut ts = String::from("(");
+        if variadic {
+            if let Some((last, non_variadic_args)) = ts_args.split_last() {
+                ts.push_str(&non_variadic_args.join(", "));
+                if !non_variadic_args.is_empty() {
+                    ts.push_str(", ");
+                }
+                ts.push_str((String::from("...") + last).as_str())
+            }
+        } else {
+            ts.push_str(&ts_args.join(", "));
+        };
+        ts.push(')');
 
         // If this function is an optional field's setter, it should have only
         // one arg, and omittable should be `true`.
@@ -307,7 +346,7 @@ impl<'a, 'b> Builder<'a, 'b> {
             ts.push_str(&ret);
             ts_ret = Some(ret);
         }
-        return (ts, ts_arg_tys, ts_ret);
+        (ts, ts_arg_tys, ts_ret)
     }
 
     /// Returns a helpful JS doc comment which lists types for all parameters
@@ -317,14 +356,26 @@ impl<'a, 'b> Builder<'a, 'b> {
         arg_names: &[String],
         arg_tys: &[&AdapterType],
         ts_ret: &Option<String>,
+        variadic: bool,
     ) -> String {
         let mut ret = String::new();
-        for (name, ty) in arg_names.iter().zip(arg_tys) {
+        let (variadic_arg, fn_arg_names) = match arg_names.split_last() {
+            Some((last, args)) if variadic => (Some(last), args),
+            _ => (None, arg_names),
+        };
+        for (name, ty) in fn_arg_names.iter().zip(arg_tys) {
             ret.push_str("@param {");
             adapter2ts(ty, &mut ret);
             ret.push_str("} ");
             ret.push_str(name);
-            ret.push_str("\n");
+            ret.push('\n');
+        }
+        if let (Some(name), Some(ty)) = (variadic_arg, arg_tys.last()) {
+            ret.push_str("@param {...");
+            adapter2ts(ty, &mut ret);
+            ret.push_str("} ");
+            ret.push_str(name);
+            ret.push('\n');
         }
         if let Some(ts) = ts_ret {
             if ts != "void" {
@@ -341,6 +392,7 @@ impl<'a, 'b> JsBuilder<'a, 'b> {
             cx,
             args: Vec::new(),
             tmp: 0,
+            pre_try: String::new(),
             finally: String::new(),
             prelude: String::new(),
             stack: Vec::new(),
@@ -355,7 +407,7 @@ impl<'a, 'b> JsBuilder<'a, 'b> {
         for line in prelude.trim().lines().map(|l| l.trim()) {
             if !line.is_empty() {
                 self.prelude.push_str(line);
-                self.prelude.push_str("\n");
+                self.prelude.push('\n');
             }
         }
     }
@@ -364,7 +416,7 @@ impl<'a, 'b> JsBuilder<'a, 'b> {
         for line in finally.trim().lines().map(|l| l.trim()) {
             if !line.is_empty() {
                 self.finally.push_str(line);
-                self.finally.push_str("\n");
+                self.finally.push('\n');
             }
         }
     }
@@ -372,7 +424,7 @@ impl<'a, 'b> JsBuilder<'a, 'b> {
     pub fn tmp(&mut self) -> usize {
         let ret = self.tmp;
         self.tmp += 1;
-        return ret;
+        ret
     }
 
     fn pop(&mut self) -> String {
@@ -396,6 +448,14 @@ impl<'a, 'b> JsBuilder<'a, 'b> {
         self.prelude(&format!("_assertNum({});", arg));
     }
 
+    fn assert_bigint(&mut self, arg: &str) {
+        if !self.cx.config.debug {
+            return;
+        }
+        self.cx.expose_assert_bigint();
+        self.prelude(&format!("_assertBigInt({});", arg));
+    }
+
     fn assert_bool(&mut self, arg: &str) {
         if !self.cx.config.debug {
             return;
@@ -411,6 +471,16 @@ impl<'a, 'b> JsBuilder<'a, 'b> {
         self.cx.expose_is_like_none();
         self.prelude(&format!("if (!isLikeNone({})) {{", arg));
         self.assert_number(arg);
+        self.prelude("}");
+    }
+
+    fn assert_optional_bigint(&mut self, arg: &str) {
+        if !self.cx.config.debug {
+            return;
+        }
+        self.cx.expose_is_like_none();
+        self.prelude(&format!("if (!isLikeNone({})) {{", arg));
+        self.assert_bigint(arg);
         self.prelude("}");
     }
 
@@ -430,7 +500,7 @@ impl<'a, 'b> JsBuilder<'a, 'b> {
         }
         self.prelude(&format!(
             "\
-                if ({0}.ptr === 0) {{
+                if ({0}.__wbg_ptr === 0) {{
                     throw new Error('Attempt to use a moved value');
                 }}
             ",
@@ -469,29 +539,46 @@ impl<'a, 'b> JsBuilder<'a, 'b> {
 
 fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) -> Result<(), Error> {
     match instr {
-        Instruction::Standard(wit_walrus::Instruction::ArgGet(n)) => {
+        Instruction::ArgGet(n) => {
             let arg = js.arg(*n).to_string();
             js.push(arg);
         }
 
-        Instruction::Standard(wit_walrus::Instruction::CallAdapter(_)) => {
-            panic!("standard call adapter functions should be mapped to our adapters");
-        }
-
-        Instruction::Standard(wit_walrus::Instruction::CallCore(_))
+        Instruction::CallCore(_)
         | Instruction::CallExport(_)
         | Instruction::CallAdapter(_)
         | Instruction::CallTableElement(_)
-        | Instruction::Standard(wit_walrus::Instruction::DeferCallCore(_)) => {
+        | Instruction::DeferFree { .. } => {
             let invoc = Invocation::from(instr, js.cx.module)?;
-            let (params, results) = invoc.params_results(js.cx);
+            let (mut params, results) = invoc.params_results(js.cx);
 
-            // Pop off the number of parameters for the function we're calling
             let mut args = Vec::new();
-            for _ in 0..params {
-                args.push(js.pop());
+            let tmp = js.tmp();
+            if invoc.defer() {
+                if let Instruction::DeferFree { .. } = instr {
+                    // Ignore `free`'s final `align` argument, since that's manually inserted later.
+                    params -= 1;
+                }
+                // If the call is deferred, the arguments to the function still need to be
+                // accessible in the `finally` block, so we declare variables to hold the args
+                // outside of the try-finally block and then set those to the args.
+                for (i, arg) in js.stack[js.stack.len() - params..].iter().enumerate() {
+                    let name = format!("deferred{tmp}_{i}");
+                    writeln!(js.pre_try, "let {name};").unwrap();
+                    writeln!(js.prelude, "{name} = {arg};").unwrap();
+                    args.push(name);
+                }
+                if let Instruction::DeferFree { align, .. } = instr {
+                    // add alignment
+                    args.push(align.to_string());
+                }
+            } else {
+                // Otherwise, pop off the number of parameters for the function we're calling.
+                for _ in 0..params {
+                    args.push(js.pop());
+                }
+                args.reverse();
             }
-            args.reverse();
 
             // Call the function through an export of the underlying module.
             let call = invoc.invoke(js.cx, &args, &mut js.prelude, log_error)?;
@@ -502,7 +589,6 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
             match (invoc.defer(), results) {
                 (true, 0) => {
                     js.finally(&format!("{};", call));
-                    js.stack.extend(args);
                 }
                 (true, _) => panic!("deferred calls must have no results"),
                 (false, 0) => js.prelude(&format!("{};", call)),
@@ -519,41 +605,36 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
             }
         }
 
-        Instruction::Standard(wit_walrus::Instruction::IntToWasm { trap: false, .. }) => {
+        Instruction::IntToWasm { input, .. } => {
             let val = js.pop();
-            js.assert_number(&val);
+            if matches!(
+                input,
+                AdapterType::I64 | AdapterType::S64 | AdapterType::U64
+            ) {
+                js.assert_bigint(&val);
+            } else {
+                js.assert_number(&val);
+            }
             js.push(val);
         }
 
         // When converting to a JS number we need to specially handle the `u32`
         // case because if the high bit is set then it comes out as a negative
         // number, but we want to switch that to an unsigned representation.
-        Instruction::Standard(wit_walrus::Instruction::WasmToInt {
-            trap: false,
-            output,
-            ..
-        }) => {
+        Instruction::WasmToInt { output, .. } => {
             let val = js.pop();
             match output {
-                wit_walrus::ValType::U32 => js.push(format!("{} >>> 0", val)),
+                AdapterType::U32 => js.push(format!("{} >>> 0", val)),
+                AdapterType::U64 => js.push(format!("BigInt.asUintN(64, {val})")),
                 _ => js.push(val),
             }
         }
 
-        Instruction::Standard(wit_walrus::Instruction::WasmToInt { trap: true, .. })
-        | Instruction::Standard(wit_walrus::Instruction::IntToWasm { trap: true, .. }) => {
-            bail!("trapping wasm-to-int and int-to-wasm instructions not supported")
-        }
-
-        Instruction::Standard(wit_walrus::Instruction::MemoryToString(mem)) => {
+        Instruction::MemoryToString(mem) => {
             let len = js.pop();
             let ptr = js.pop();
             let get = js.cx.expose_get_string_from_wasm(*mem)?;
             js.push(format!("{}({}, {})", get, ptr, len));
-        }
-
-        Instruction::Standard(wit_walrus::Instruction::StringToMemory { mem, malloc }) => {
-            js.string_to_memory(*mem, *malloc, None)?;
         }
 
         Instruction::StringToMemory {
@@ -577,6 +658,7 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
         Instruction::StoreRetptr { ty, offset, mem } => {
             let (mem, size) = match ty {
                 AdapterType::I32 => (js.cx.expose_int32_memory(*mem), 4),
+                AdapterType::I64 => (js.cx.expose_int64_memory(*mem), 8),
                 AdapterType::F32 => (js.cx.expose_f32_memory(*mem), 4),
                 AdapterType::F64 => (js.cx.expose_f64_memory(*mem), 8),
                 other => bail!("invalid aggregate return type {:?}", other),
@@ -598,6 +680,7 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
         Instruction::LoadRetptr { ty, offset, mem } => {
             let (mem, quads) = match ty {
                 AdapterType::I32 => (js.cx.expose_int32_memory(*mem), 1),
+                AdapterType::I64 => (js.cx.expose_int64_memory(*mem), 2),
                 AdapterType::F32 => (js.cx.expose_f32_memory(*mem), 1),
                 AdapterType::F64 => (js.cx.expose_f64_memory(*mem), 2),
                 other => bail!("invalid aggregate return type {:?}", other),
@@ -642,19 +725,18 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
 
         Instruction::I32FromExternrefRustOwned { class } => {
             let val = js.pop();
-            js.assert_class(&val, &class);
+            js.assert_class(&val, class);
             js.assert_not_moved(&val);
             let i = js.tmp();
-            js.prelude(&format!("var ptr{} = {}.ptr;", i, val));
-            js.prelude(&format!("{}.ptr = 0;", val));
+            js.prelude(&format!("var ptr{} = {}.__destroy_into_raw();", i, val));
             js.push(format!("ptr{}", i));
         }
 
         Instruction::I32FromExternrefRustBorrow { class } => {
             let val = js.pop();
-            js.assert_class(&val, &class);
+            js.assert_class(&val, class);
             js.assert_not_moved(&val);
-            js.push(format!("{}.ptr", val));
+            js.push(format!("{}.__wbg_ptr", val));
         }
 
         Instruction::I32FromOptionRust { class } => {
@@ -665,56 +747,9 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
             js.prelude(&format!("if (!isLikeNone({0})) {{", val));
             js.assert_class(&val, class);
             js.assert_not_moved(&val);
-            js.prelude(&format!("ptr{} = {}.ptr;", i, val));
-            js.prelude(&format!("{}.ptr = 0;", val));
+            js.prelude(&format!("ptr{} = {}.__destroy_into_raw();", i, val));
             js.prelude("}");
             js.push(format!("ptr{}", i));
-        }
-
-        Instruction::I32Split64 { signed } => {
-            let val = js.pop();
-            let f = if *signed {
-                js.cx.expose_int64_cvt_shim()
-            } else {
-                js.cx.expose_uint64_cvt_shim()
-            };
-            let i = js.tmp();
-            js.prelude(&format!(
-                "
-                 {f}[0] = {val};
-                 const low{i} = u32CvtShim[0];
-                 const high{i} = u32CvtShim[1];
-                 ",
-                i = i,
-                f = f,
-                val = val,
-            ));
-            js.push(format!("low{}", i));
-            js.push(format!("high{}", i));
-        }
-
-        Instruction::I32SplitOption64 { signed } => {
-            let val = js.pop();
-            js.cx.expose_is_like_none();
-            let f = if *signed {
-                js.cx.expose_int64_cvt_shim()
-            } else {
-                js.cx.expose_uint64_cvt_shim()
-            };
-            let i = js.tmp();
-            js.prelude(&format!(
-                "\
-                    {f}[0] = isLikeNone({val}) ? BigInt(0) : {val};
-                    const low{i} = u32CvtShim[0];
-                    const high{i} = u32CvtShim[1];
-                ",
-                i = i,
-                f = f,
-                val = val,
-            ));
-            js.push(format!("!isLikeNone({0})", val));
-            js.push(format!("low{}", i));
-            js.push(format!("high{}", i));
         }
 
         Instruction::I32FromOptionExternref { table_and_alloc } => {
@@ -762,12 +797,23 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
             js.push(format!("isLikeNone({0}) ? {1} : {0}", val, hole));
         }
 
-        Instruction::FromOptionNative { .. } => {
+        Instruction::FromOptionNative { ty } => {
             let val = js.pop();
             js.cx.expose_is_like_none();
-            js.assert_optional_number(&val);
+            if *ty == ValType::I64 {
+                js.assert_optional_bigint(&val);
+            } else {
+                js.assert_optional_number(&val);
+            }
             js.push(format!("!isLikeNone({0})", val));
-            js.push(format!("isLikeNone({0}) ? 0 : {0}", val));
+            js.push(format!(
+                "isLikeNone({val}) ? {zero} : {val}",
+                zero = if *ty == ValType::I64 {
+                    "BigInt(0)"
+                } else {
+                    "0"
+                }
+            ));
         }
 
         Instruction::VectorToMemory { kind, malloc, mem } => {
@@ -895,15 +941,8 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
             js.push(format!("len{}", i));
         }
 
-        Instruction::MutableSliceToMemory {
-            kind,
-            malloc,
-            mem,
-            free,
-        } => {
-            // First up, pass the JS value into wasm, getting out a pointer and
-            // a length. These two pointer/length values get pushed onto the
-            // value stack.
+        Instruction::MutableSliceToMemory { kind, malloc, mem } => {
+            // Copy the contents of the typed array into wasm.
             let val = js.pop();
             let func = js.cx.pass_to_wasm_function(kind.clone(), *mem)?;
             let malloc = js.cx.export_name_of(*malloc);
@@ -916,25 +955,12 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
                 malloc = malloc,
             ));
             js.prelude(&format!("var len{} = WASM_VECTOR_LEN;", i));
+            // Then pass it the pointer and the length of where we copied it.
             js.push(format!("ptr{}", i));
             js.push(format!("len{}", i));
-
-            // Next we set up a `finally` clause which will both update the
-            // original mutable slice with any modifications, and then free the
-            // Rust-backed memory.
-            let free = js.cx.export_name_of(*free);
-            let get = js.cx.memview_function(kind.clone(), *mem);
-            js.finally(&format!(
-                "
-                    {val}.set({get}().subarray(ptr{i} / {size}, ptr{i} / {size} + len{i}));
-                    wasm.{free}(ptr{i}, len{i} * {size});
-                ",
-                val = val,
-                get = get,
-                free = free,
-                size = kind.size(),
-                i = i,
-            ));
+            // Then we give wasm a reference to the original typed array, so that it can
+            // update it with modifications made on the wasm side before returning.
+            js.push(val);
         }
 
         Instruction::BoolFromI32 => {
@@ -942,38 +968,22 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
             js.push(format!("{} !== 0", val));
         }
 
-        Instruction::ExternrefLoadOwned => {
-            js.cx.expose_take_object();
+        Instruction::ExternrefLoadOwned { table_and_drop } => {
+            let take_object = if let Some((table, drop)) = *table_and_drop {
+                js.cx
+                    .expose_take_from_externref_table(table, drop)?
+                    .to_string()
+            } else {
+                js.cx.expose_take_object();
+                "takeObject".to_string()
+            };
             let val = js.pop();
-            js.push(format!("takeObject({})", val));
+            js.push(format!("{}({})", take_object, val));
         }
 
         Instruction::StringFromChar => {
             let val = js.pop();
             js.push(format!("String.fromCodePoint({})", val));
-        }
-
-        Instruction::I64FromLoHi { signed } => {
-            let f = if *signed {
-                js.cx.expose_int64_cvt_shim()
-            } else {
-                js.cx.expose_uint64_cvt_shim()
-            };
-            let i = js.tmp();
-            let high = js.pop();
-            let low = js.pop();
-            js.prelude(&format!(
-                "\
-                     u32CvtShim[0] = {low};
-                     u32CvtShim[1] = {high};
-                     const n{i} = {f}[0];
-                 ",
-                low = low,
-                high = high,
-                f = f,
-                i = i,
-            ));
-            js.push(format!("n{}", i))
         }
 
         Instruction::RustFromI32 { class } => {
@@ -996,12 +1006,13 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
             optional: _,
             mem,
             free,
+            table,
         } => {
             let len = js.pop();
             let ptr = js.pop();
             let tmp = js.tmp();
 
-            let get = js.cx.expose_get_cached_string_from_wasm(*mem)?;
+            let get = js.cx.expose_get_cached_string_from_wasm(*mem, *table)?;
 
             js.prelude(&format!("var v{} = {}({}, {});", tmp, get, ptr, len));
 
@@ -1134,14 +1145,21 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
             js.push(format!("{0} === 0xFFFFFF ? undefined : {0}", val));
         }
 
-        Instruction::ToOptionNative { ty: _, signed } => {
+        Instruction::ToOptionNative { ty, signed } => {
             let val = js.pop();
             let present = js.pop();
             js.push(format!(
-                "{} === 0 ? undefined : {}{}",
+                "{} === 0 ? undefined : {}",
                 present,
-                val,
-                if *signed { "" } else { " >>> 0" },
+                if *signed {
+                    val
+                } else {
+                    match ty {
+                        ValType::I32 => format!("{val} >>> 0"),
+                        ValType::I64 => format!("BigInt.asUintN(64, {val})"),
+                        _ => unreachable!("unsigned non-integer"),
+                    }
+                },
             ));
         }
 
@@ -1162,31 +1180,6 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
             let val = js.pop();
             js.push(format!("{0} === {1} ? undefined : {0}", val, hole));
         }
-
-        Instruction::Option64FromI32 { signed } => {
-            let f = if *signed {
-                js.cx.expose_int64_cvt_shim()
-            } else {
-                js.cx.expose_uint64_cvt_shim()
-            };
-            let i = js.tmp();
-            let high = js.pop();
-            let low = js.pop();
-            let present = js.pop();
-            js.prelude(&format!(
-                "
-                    u32CvtShim[0] = {low};
-                    u32CvtShim[1] = {high};
-                    const n{i} = {present} === 0 ? undefined : {f}[0];
-                ",
-                present = present,
-                low = low,
-                high = high,
-                f = f,
-                i = i,
-            ));
-            js.push(format!("n{}", i));
-        }
     }
     Ok(())
 }
@@ -1200,13 +1193,13 @@ impl Invocation {
     fn from(instr: &Instruction, module: &Module) -> Result<Invocation, Error> {
         use Instruction::*;
         Ok(match instr {
-            Standard(wit_walrus::Instruction::CallCore(f)) => Invocation::Core {
+            CallCore(f) => Invocation::Core {
                 id: *f,
                 defer: false,
             },
 
-            Standard(wit_walrus::Instruction::DeferCallCore(f)) => Invocation::Core {
-                id: *f,
+            DeferFree { free, .. } => Invocation::Core {
+                id: *free,
                 defer: true,
             },
 
@@ -1295,7 +1288,7 @@ fn adapter2ts(ty: &AdapterType, dst: &mut String) {
         | AdapterType::U32
         | AdapterType::F32
         | AdapterType::F64 => dst.push_str("number"),
-        AdapterType::I64 | AdapterType::S64 | AdapterType::U64 => dst.push_str("BigInt"),
+        AdapterType::I64 | AdapterType::S64 | AdapterType::U64 => dst.push_str("bigint"),
         AdapterType::String => dst.push_str("string"),
         AdapterType::Externref => dst.push_str("any"),
         AdapterType::Bool => dst.push_str("boolean"),

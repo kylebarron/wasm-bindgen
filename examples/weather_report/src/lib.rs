@@ -8,7 +8,6 @@ use std::time::{Duration, UNIX_EPOCH};
 use gloo::events::EventListener;
 use json::JsonValue;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::Document;
 use web_sys::Element;
@@ -20,7 +19,7 @@ extern "C" {
 }
 
 #[wasm_bindgen(start)]
-pub fn run() -> Result<(), JsValue> {
+fn run() -> Result<(), JsValue> {
     let window = web_sys::window().expect("no global `window` exists");
     let document = window.document().expect("should have a document on window");
     let body = document.body().expect("document should have a body");
@@ -153,11 +152,11 @@ pub fn run() -> Result<(), JsValue> {
         let sunset = suns_s_td_div.clone();
         let geo = geo_shtd_div.clone();
         let input_value: &'static _ = Box::leak(Box::new(input_value));
-        let response = get_response(&input_value);
+        let response = get_response(input_value);
         spawn_local(async move {
             let parsed = response.await;
-            let lon = (&parsed["coord"]["lon"]).to_owned().as_f64().unwrap();
-            let lat = (&parsed["coord"]["lat"]).to_owned().as_f64().unwrap();
+            let lon = parsed["coord"]["lon"].to_owned().as_f64().unwrap();
+            let lat = parsed["coord"]["lat"].to_owned().as_f64().unwrap();
             initialize(lat, lon);
             let city_name: &str = &parsed["name"].to_owned().to_string();
             let country_name: &str = &parsed["sys"]["country"].to_owned().to_string();
@@ -170,14 +169,17 @@ pub fn run() -> Result<(), JsValue> {
                 "  ",
             ]
             .concat();
-            let temp = ((&parsed["main"]["temp"]).to_owned().as_f64().unwrap() - 273.15) as i64;
+            let temp = (parsed["main"]["temp"].to_owned().as_f64().unwrap() - 273.15) as i64;
 
             let content = [src, temp.to_string()].concat();
             let p: &str = &parsed["main"]["pressure"].to_owned().to_string();
             let h: &str = &parsed["main"]["humidity"].to_owned().to_string();
-            let sun_r = ((&parsed["sys"]["sunrise"]).to_owned().as_f64().unwrap()) as u64;
-            let sun_s = ((&parsed["sys"]["sunset"]).to_owned().as_f64().unwrap()) as u64;
-            temp_d.set_attribute("style", "display: block");
+            let sun_r = (parsed["sys"]["sunrise"].to_owned().as_f64().unwrap()) as u64;
+            let sun_s = (parsed["sys"]["sunset"].to_owned().as_f64().unwrap()) as u64;
+
+            temp_d
+                .set_attribute("style", "display: block")
+                .expect("failed to set attr style");
             city.set_inner_html(&place);
             image.set_inner_html(&content);
             weather.set_inner_html(&parsed["weather"][0]["main"].to_owned().to_string());
@@ -206,9 +208,15 @@ fn create_div(document: &Document, id: &str, class: &str) -> Element {
 
 fn create_submit_box(document: &Document) -> Element {
     let submit_box: Element = document.create_element("input").unwrap();
-    submit_box.set_attribute("type", "button");
-    submit_box.set_attribute("value", "Search");
-    submit_box.set_attribute("name", "submit");
+    submit_box
+        .set_attribute("type", "button")
+        .expect("failed to set attr type to button");
+    submit_box
+        .set_attribute("value", "Search")
+        .expect("failed to set attr value to Search");
+    submit_box
+        .set_attribute("name", "submit")
+        .expect("failed to set attr name to submit");
     submit_box.set_id("submit");
     submit_box.set_class_name(" ReportStyles-bootstrapButton btn btn-info");
     submit_box
@@ -216,10 +224,19 @@ fn create_submit_box(document: &Document) -> Element {
 
 fn create_input_box(document: &Document) -> Element {
     let input_box = document.create_element("input").unwrap();
-    input_box.set_attribute("name", "name");
-    input_box.set_attribute("value", "Delhi");
-    input_box.set_attribute("type", "text");
-    input_box.set_attribute("placeholder", "Type city name here");
+    input_box
+        .set_attribute("name", "name")
+        .expect("failed to set attr name to name");
+    input_box.set_attribute("value", "Delhi").expect(
+        "
+    failed to set attr value to Delhi",
+    );
+    input_box
+        .set_attribute("type", "text")
+        .expect("failed to set attr type to text");
+    input_box
+        .set_attribute("placeholder", "Type city name here")
+        .expect("Failed to set attr placeholder to Type city name here");
     input_box.set_id("name");
     input_box.set_class_name("ReportStyles-search");
     input_box

@@ -2,7 +2,6 @@ use futures_channel::oneshot;
 use js_sys::{Promise, Uint8ClampedArray, WebAssembly};
 use rayon::prelude::*;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 
 macro_rules! console_log {
     ($($t:tt)*) => (crate::log(&format_args!($($t)*).to_string()))
@@ -28,11 +27,10 @@ impl Scene {
     /// Creates a new scene from the JSON description in `object`, which we
     /// deserialize here into an actual scene.
     #[wasm_bindgen(constructor)]
-    pub fn new(object: &JsValue) -> Result<Scene, JsValue> {
+    pub fn new(object: JsValue) -> Result<Scene, JsValue> {
         console_error_panic_hook::set_once();
         Ok(Scene {
-            inner: object
-                .into_serde()
+            inner: serde_wasm_bindgen::from_value(object)
                 .map_err(|e| JsValue::from(e.to_string()))?,
         })
     }
@@ -61,7 +59,10 @@ impl Scene {
         // `pool`.
         let thread_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(concurrency)
-            .spawn_handler(|thread| Ok(pool.run(|| thread.run()).unwrap()))
+            .spawn_handler(|thread| {
+                pool.run(|| thread.run()).unwrap();
+                Ok(())
+            })
             .build()
             .unwrap();
 

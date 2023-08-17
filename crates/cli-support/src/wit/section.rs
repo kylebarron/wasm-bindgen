@@ -16,9 +16,9 @@
 //! generating any JS glue. Any JS glue currently generated is also invalid if
 //! the module contains the wasm bindings section and it's actually respected.
 
-use crate::wit::{AdapterId, AdapterJsImportKind, AdapterType, Instruction};
+use crate::wit::AuxExport;
+use crate::wit::{AdapterId, AdapterJsImportKind, AdapterType, AuxExportedMethodKind, Instruction};
 use crate::wit::{AdapterKind, NonstandardWitSection, WasmBindgenAux};
-use crate::wit::{AuxExport, InstructionData};
 use crate::wit::{AuxExportKind, AuxImport, AuxValue, JsImport, JsImportName};
 use anyhow::{anyhow, bail, Context, Error};
 use std::collections::HashMap;
@@ -213,94 +213,6 @@ pub fn add(module: &mut Module) -> Result<(), Error> {
     Ok(())
 }
 
-fn translate_instruction(
-    instr: &InstructionData,
-    us2walrus: &HashMap<AdapterId, wit_walrus::FuncId>,
-    module: &Module,
-) -> Result<wit_walrus::Instruction, Error> {
-    use Instruction::*;
-
-    match &instr.instr {
-        Standard(s) => Ok(s.clone()),
-        CallAdapter(id) => {
-            let id = us2walrus[id];
-            Ok(wit_walrus::Instruction::CallAdapter(id))
-        }
-        CallExport(e) => match module.exports.get(*e).item {
-            walrus::ExportItem::Function(f) => Ok(wit_walrus::Instruction::CallCore(f)),
-            _ => bail!("can only call exported functions"),
-        },
-        CallTableElement(e) => {
-            let entry = wasm_bindgen_wasm_conventions::get_function_table_entry(module, *e)?;
-            let id = entry
-                .func
-                .ok_or_else(|| anyhow!("function table wasn't filled in a {}", e))?;
-            Ok(wit_walrus::Instruction::CallCore(id))
-        }
-        StringToMemory {
-            mem,
-            malloc,
-            realloc: _,
-        } => Ok(wit_walrus::Instruction::StringToMemory {
-            mem: *mem,
-            malloc: *malloc,
-        }),
-        StoreRetptr { .. } | LoadRetptr { .. } | Retptr { .. } => {
-            bail!("return pointers aren't supported in wasm interface types");
-        }
-        I32FromBool | BoolFromI32 => {
-            bail!("booleans aren't supported in wasm interface types");
-        }
-        I32FromStringFirstChar | StringFromChar => {
-            bail!("chars aren't supported in wasm interface types");
-        }
-        I32FromExternrefOwned | I32FromExternrefBorrow | ExternrefLoadOwned | TableGet => {
-            bail!("externref pass failed to sink into wasm module");
-        }
-        I32FromExternrefRustOwned { .. }
-        | I32FromExternrefRustBorrow { .. }
-        | RustFromI32 { .. } => {
-            bail!("rust types aren't supported in wasm interface types");
-        }
-        I32Split64 { .. } | I64FromLoHi { .. } => {
-            bail!("64-bit integers aren't supported in wasm-bindgen");
-        }
-        I32SplitOption64 { .. }
-        | I32FromOptionExternref { .. }
-        | I32FromOptionU32Sentinel
-        | I32FromOptionRust { .. }
-        | I32FromOptionBool
-        | I32FromOptionChar
-        | I32FromOptionEnum { .. }
-        | FromOptionNative { .. }
-        | OptionVector { .. }
-        | OptionString { .. }
-        | OptionRustFromI32 { .. }
-        | OptionVectorLoad { .. }
-        | OptionView { .. }
-        | OptionU32Sentinel
-        | ToOptionNative { .. }
-        | OptionBoolFromI32
-        | OptionCharFromI32
-        | OptionEnumFromI32 { .. }
-        | Option64FromI32 { .. } => {
-            bail!("optional types aren't supported in wasm bindgen");
-        }
-        UnwrapResult { .. } | UnwrapResultString { .. } => {
-            bail!("self-unwrapping result types aren't supported in wasm bindgen");
-        }
-        MutableSliceToMemory { .. } | VectorToMemory { .. } | VectorLoad { .. } | View { .. } => {
-            bail!("vector slices aren't supported in wasm interface types yet");
-        }
-        CachedStringLoad { .. } => {
-            bail!("cached strings aren't supported in wasm interface types");
-        }
-        StackClosure { .. } => {
-            bail!("closures aren't supported in wasm interface types");
-        }
-    }
-}
-
 fn check_standard_import(import: &AuxImport) -> Result<(), Error> {
     let desc_js = |js: &JsImport| {
         let mut extra = String::new();
@@ -366,6 +278,9 @@ fn check_standard_import(import: &AuxImport) -> Result<(), Error> {
         AuxImport::Intrinsic(intrinsic) => {
             format!("wasm-bindgen specific intrinsic `{}`", intrinsic.name())
         }
+        AuxImport::LinkTo(path, _) => {
+            format!("wasm-bindgen specific link function for `{}`", path)
+        }
         AuxImport::Closure { .. } => format!("creating a `Closure` wrapper"),
     };
     bail!("import of {} requires JS glue", item);
@@ -383,38 +298,22 @@ fn check_standard_export(export: &AuxExport) -> Result<(), Error> {
                 name,
             );
         }
-        AuxExportKind::Getter { class, field, .. } => {
+        AuxExportKind::Method {
+            class, name, kind, ..
+        } => {
+            let kind_name = match kind {
+                AuxExportedMethodKind::Method => "method",
+                AuxExportedMethodKind::Getter => "getter",
+                AuxExportedMethodKind::Setter => "setter",
+            };
+
             bail!(
-                "cannot export `{}::{}` getter function when generating \
-                 a standalone WebAssembly module with no JS glue",
-                class,
-                field,
-            );
-        }
-        AuxExportKind::Setter { class, field, .. } => {
-            bail!(
-                "cannot export `{}::{}` setter function when generating \
-                 a standalone WebAssembly module with no JS glue",
-                class,
-                field,
-            );
-        }
-        AuxExportKind::StaticFunction { class, name } => {
-            bail!(
-                "cannot export `{}::{}` static function when \
+                "cannot export `{}::{}` {} when \
                  generating a standalone WebAssembly module with no \
                  JS glue",
                 class,
-                name
-            );
-        }
-        AuxExportKind::Method { class, name, .. } => {
-            bail!(
-                "cannot export `{}::{}` method when \
-                 generating a standalone WebAssembly module with no \
-                 JS glue",
-                class,
-                name
+                name,
+                kind_name
             );
         }
     }

@@ -100,13 +100,14 @@ pub fn execute(
     path.push(tmpdir.to_path_buf());
     let extra_node_args = env::var("NODE_ARGS")
         .unwrap_or_default()
-        .split(",")
+        .split(',')
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();
     exec(
         Command::new("node")
             .env("NODE_PATH", env::join_paths(&path).unwrap())
+            .arg("--expose-gc")
             .args(&extra_node_args)
             .arg(&js_path)
             .args(args),
@@ -116,9 +117,7 @@ pub fn execute(
 #[cfg(unix)]
 pub fn exec(cmd: &mut Command) -> Result<(), Error> {
     use std::os::unix::prelude::*;
-    Err(Error::from(cmd.exec())
-        .context("failed to execute `node`")
-        .into())
+    Err(Error::from(cmd.exec()).context("failed to execute `node`"))
 }
 
 #[cfg(windows)]

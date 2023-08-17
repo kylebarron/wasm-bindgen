@@ -65,7 +65,7 @@ pub enum AdapterJsImportKind {
     Normal,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AdapterType {
     S8,
     S16,
@@ -91,9 +91,13 @@ pub enum AdapterType {
 
 #[derive(Debug, Clone)]
 pub enum Instruction {
-    /// A known instruction in the "standard"
-    Standard(wit_walrus::Instruction),
-
+    /// Calls a function by its id.
+    CallCore(walrus::FunctionId),
+    /// Call the deallocation function.
+    DeferFree {
+        free: walrus::FunctionId,
+        align: usize,
+    },
     /// A call to one of our own defined adapters, similar to the standard
     /// call-adapter instruction
     CallAdapter(AdapterId),
@@ -101,6 +105,9 @@ pub enum Instruction {
     CallExport(walrus::ExportId),
     /// Call an element in the function table of the core module
     CallTableElement(u32),
+
+    /// Gets an argument by its index.
+    ArgGet(u32),
 
     /// An instruction to store `ty` at the `offset` index in the return pointer
     StoreRetptr {
@@ -118,6 +125,17 @@ pub enum Instruction {
     /// `size` bytes of space.
     Retptr {
         size: u32,
+    },
+
+    /// Pops a typed integer (`u8`, `s16`, etc.) and pushes a plain wasm `i32` or `i64` equivalent.
+    IntToWasm {
+        input: AdapterType,
+        output: walrus::ValType,
+    },
+    /// Pops a wasm `i32` or `i64` and pushes a typed integer (`u8`, `s16`, etc.) equivalent.
+    WasmToInt {
+        input: walrus::ValType,
+        output: AdapterType,
     },
 
     /// Pops a `bool` from the stack and pushes an `i32` equivalent
@@ -145,16 +163,6 @@ pub enum Instruction {
     /// consumed pointer value if it's "some".
     I32FromOptionRust {
         class: String,
-    },
-    /// Pops an `s64` or `u64` from the stack, pushing two `i32` values.
-    I32Split64 {
-        signed: bool,
-    },
-    /// Pops an `s64` or `u64` from the stack, pushing three `i32` values.
-    /// First is the "some/none" bit, and the next is the low bits, and the
-    /// next is the high bits.
-    I32SplitOption64 {
-        signed: bool,
     },
     /// Pops an `externref` from the stack, pushes either 0 if it's "none" or and
     /// index into the owned wasm table it was stored at if it's "some"
@@ -195,7 +203,6 @@ pub enum Instruction {
     MutableSliceToMemory {
         kind: VectorKind,
         malloc: walrus::FunctionId,
-        free: walrus::FunctionId,
         mem: walrus::MemoryId,
     },
 
@@ -211,6 +218,8 @@ pub enum Instruction {
         mem: walrus::MemoryId,
         realloc: Option<walrus::FunctionId>,
     },
+    /// Pops a pointer + length, pushes a string
+    MemoryToString(walrus::MemoryId),
 
     /// Pops an externref, pushes pointer/length or all zeros
     OptionVector {
@@ -233,13 +242,13 @@ pub enum Instruction {
     /// pops a `i32`, pushes `bool`
     BoolFromI32,
     /// pops `i32`, loads externref at that slot, dealloates externref, pushes `externref`
-    ExternrefLoadOwned,
+    ExternrefLoadOwned {
+        /// This is needed solely for `Result`, since it can contain externrefs,
+        /// but has to pass them through a retptr.
+        table_and_drop: Option<(walrus::TableId, walrus::FunctionId)>,
+    },
     /// pops `i32`, pushes string from that `char`
     StringFromChar,
-    /// pops two `i32`, pushes a 64-bit number
-    I64FromLoHi {
-        signed: bool,
-    },
     /// pops `i32`, pushes an externref for the wrapped rust class
     RustFromI32 {
         class: String,
@@ -253,6 +262,8 @@ pub enum Instruction {
         optional: bool,
         mem: walrus::MemoryId,
         free: walrus::FunctionId,
+        /// If we're in reference-types mode, the externref table ID to get the cached string from.
+        table: Option<walrus::TableId>,
     },
     /// pops ptr/length, pushes a vector, frees the original data
     VectorLoad {
@@ -296,31 +307,9 @@ pub enum Instruction {
     OptionEnumFromI32 {
         hole: u32,
     },
-    Option64FromI32 {
-        signed: bool,
-    },
 }
 
 impl AdapterType {
-    pub fn from_wit(wit: wit_walrus::ValType) -> AdapterType {
-        match wit {
-            wit_walrus::ValType::S8 => AdapterType::S8,
-            wit_walrus::ValType::S16 => AdapterType::S16,
-            wit_walrus::ValType::S32 => AdapterType::S32,
-            wit_walrus::ValType::S64 => AdapterType::S64,
-            wit_walrus::ValType::U8 => AdapterType::U8,
-            wit_walrus::ValType::U16 => AdapterType::U16,
-            wit_walrus::ValType::U32 => AdapterType::U32,
-            wit_walrus::ValType::U64 => AdapterType::U64,
-            wit_walrus::ValType::F32 => AdapterType::F32,
-            wit_walrus::ValType::F64 => AdapterType::F64,
-            wit_walrus::ValType::String => AdapterType::String,
-            wit_walrus::ValType::Externref => AdapterType::Externref,
-            wit_walrus::ValType::I32 => AdapterType::I32,
-            wit_walrus::ValType::I64 => AdapterType::I64,
-        }
-    }
-
     pub fn from_wasm(wasm: walrus::ValType) -> Option<AdapterType> {
         Some(match wasm {
             walrus::ValType::I32 => AdapterType::I32,
@@ -340,33 +329,6 @@ impl AdapterType {
             AdapterType::F64 => walrus::ValType::F64,
             AdapterType::Externref | AdapterType::NamedExternref(_) => walrus::ValType::Externref,
             _ => return None,
-        })
-    }
-
-    pub fn to_wit(&self) -> Option<wit_walrus::ValType> {
-        Some(match self {
-            AdapterType::S8 => wit_walrus::ValType::S8,
-            AdapterType::S16 => wit_walrus::ValType::S16,
-            AdapterType::S32 => wit_walrus::ValType::S32,
-            AdapterType::S64 => wit_walrus::ValType::S64,
-            AdapterType::U8 => wit_walrus::ValType::U8,
-            AdapterType::U16 => wit_walrus::ValType::U16,
-            AdapterType::U32 => wit_walrus::ValType::U32,
-            AdapterType::U64 => wit_walrus::ValType::U64,
-            AdapterType::F32 => wit_walrus::ValType::F32,
-            AdapterType::F64 => wit_walrus::ValType::F64,
-            AdapterType::String => wit_walrus::ValType::String,
-            AdapterType::Externref | AdapterType::NamedExternref(_) => {
-                wit_walrus::ValType::Externref
-            }
-
-            AdapterType::I32 => wit_walrus::ValType::I32,
-            AdapterType::I64 => wit_walrus::ValType::I64,
-            AdapterType::Option(_)
-            | AdapterType::Function
-            | AdapterType::Struct(_)
-            | AdapterType::Bool
-            | AdapterType::Vector(_) => return None,
         })
     }
 
@@ -394,7 +356,7 @@ impl NonstandardWitSection {
                 kind,
             },
         );
-        return id;
+        id
     }
 
     /// Removes any dead entries in `adapters` that are no longer necessary
@@ -463,29 +425,23 @@ impl walrus::CustomSection for NonstandardWitSection {
             };
             for instr in instrs {
                 match instr.instr {
-                    Standard(wit_walrus::Instruction::DeferCallCore(f))
-                    | Standard(wit_walrus::Instruction::CallCore(f)) => {
+                    DeferFree { free: f, .. } | CallCore(f) => {
                         roots.push_func(f);
                     }
                     StoreRetptr { mem, .. }
                     | LoadRetptr { mem, .. }
                     | View { mem, .. }
                     | OptionView { mem, .. }
-                    | Standard(wit_walrus::Instruction::MemoryToString(mem)) => {
+                    | MemoryToString(mem) => {
                         roots.push_memory(mem);
                     }
-                    VectorToMemory { malloc, mem, .. }
-                    | OptionVector { malloc, mem, .. }
-                    | Standard(wit_walrus::Instruction::StringToMemory { mem, malloc }) => {
+                    VectorToMemory { malloc, mem, .. } | OptionVector { malloc, mem, .. } => {
                         roots.push_memory(mem);
                         roots.push_func(malloc);
                     }
-                    MutableSliceToMemory {
-                        free, malloc, mem, ..
-                    } => {
+                    MutableSliceToMemory { malloc, mem, .. } => {
                         roots.push_memory(mem);
                         roots.push_func(malloc);
-                        roots.push_func(free);
                     }
                     VectorLoad { free, mem, .. }
                     | OptionVectorLoad { free, mem, .. }
@@ -509,11 +465,11 @@ impl walrus::CustomSection for NonstandardWitSection {
                             roots.push_func(id);
                         }
                     }
-                    I32FromOptionExternref { table_and_alloc } => {
-                        if let Some((table, alloc)) = table_and_alloc {
-                            roots.push_table(table);
-                            roots.push_func(alloc);
-                        }
+                    I32FromOptionExternref {
+                        table_and_alloc: Some((table, alloc)),
+                    } => {
+                        roots.push_table(table);
+                        roots.push_func(alloc);
                     }
                     UnwrapResult { table_and_drop } | UnwrapResultString { table_and_drop } => {
                         if let Some((table, drop)) = table_and_drop {

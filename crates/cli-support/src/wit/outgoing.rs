@@ -42,14 +42,18 @@ impl InstructionBuilder<'_, '_> {
             Descriptor::Externref => {
                 self.instruction(
                     &[AdapterType::I32],
-                    Instruction::ExternrefLoadOwned,
+                    Instruction::ExternrefLoadOwned {
+                        table_and_drop: None,
+                    },
                     &[AdapterType::Externref],
                 );
             }
             Descriptor::NamedExternref(name) => {
                 self.instruction(
                     &[AdapterType::I32],
-                    Instruction::ExternrefLoadOwned,
+                    Instruction::ExternrefLoadOwned {
+                        table_and_drop: None,
+                    },
                     &[AdapterType::NamedExternref(name.clone())],
                 );
             }
@@ -59,6 +63,8 @@ impl InstructionBuilder<'_, '_> {
             Descriptor::U16 => self.outgoing_i32(AdapterType::U16),
             Descriptor::I32 => self.outgoing_i32(AdapterType::S32),
             Descriptor::U32 => self.outgoing_i32(AdapterType::U32),
+            Descriptor::I64 => self.outgoing_i64(AdapterType::I64),
+            Descriptor::U64 => self.outgoing_i64(AdapterType::U64),
             Descriptor::F32 => {
                 self.get(AdapterType::F32);
                 self.output.push(AdapterType::F32);
@@ -74,22 +80,6 @@ impl InstructionBuilder<'_, '_> {
                     &[AdapterType::I32],
                     Instruction::StringFromChar,
                     &[AdapterType::String],
-                );
-            }
-
-            Descriptor::I64 | Descriptor::U64 => {
-                let signed = match arg {
-                    Descriptor::I64 => true,
-                    _ => false,
-                };
-                self.instruction(
-                    &[AdapterType::I32, AdapterType::I32],
-                    Instruction::I64FromLoHi { signed },
-                    &[if signed {
-                        AdapterType::S64
-                    } else {
-                        AdapterType::U64
-                    }],
                 );
             }
 
@@ -114,9 +104,8 @@ impl InstructionBuilder<'_, '_> {
 
                 // ... then defer a call to `free` to happen later
                 let free = self.cx.free()?;
-                let std = wit_walrus::Instruction::DeferCallCore(free);
                 self.instructions.push(InstructionData {
-                    instr: Instruction::Standard(std),
+                    instr: Instruction::DeferFree { free, align: 1 },
                     stack_change: StackChange::Modified {
                         popped: 2,
                         pushed: 2,
@@ -124,9 +113,8 @@ impl InstructionBuilder<'_, '_> {
                 });
 
                 // ... and then convert it to a string type
-                let std = wit_walrus::Instruction::MemoryToString(self.cx.memory()?);
                 self.instructions.push(InstructionData {
-                    instr: Instruction::Standard(std),
+                    instr: Instruction::MemoryToString(self.cx.memory()?),
                     stack_change: StackChange::Modified {
                         popped: 2,
                         pushed: 1,
@@ -191,10 +179,9 @@ impl InstructionBuilder<'_, '_> {
             Descriptor::CachedString => self.cached_string(false, false)?,
 
             Descriptor::String => {
-                let std = wit_walrus::Instruction::MemoryToString(self.cx.memory()?);
                 self.instruction(
                     &[AdapterType::I32, AdapterType::I32],
-                    Instruction::Standard(std),
+                    Instruction::MemoryToString(self.cx.memory()?),
                     &[AdapterType::String],
                 );
             }
@@ -252,14 +239,18 @@ impl InstructionBuilder<'_, '_> {
                 // is the valid owned index.
                 self.instruction(
                     &[AdapterType::I32],
-                    Instruction::ExternrefLoadOwned,
+                    Instruction::ExternrefLoadOwned {
+                        table_and_drop: None,
+                    },
                     &[AdapterType::Externref.option()],
                 );
             }
             Descriptor::NamedExternref(name) => {
                 self.instruction(
                     &[AdapterType::I32],
-                    Instruction::ExternrefLoadOwned,
+                    Instruction::ExternrefLoadOwned {
+                        table_and_drop: None,
+                    },
                     &[AdapterType::NamedExternref(name.clone()).option()],
                 );
             }
@@ -269,19 +260,10 @@ impl InstructionBuilder<'_, '_> {
             Descriptor::U16 => self.out_option_sentinel(AdapterType::U16),
             Descriptor::I32 => self.option_native(true, ValType::I32),
             Descriptor::U32 => self.option_native(false, ValType::I32),
+            Descriptor::I64 => self.option_native(true, ValType::I64),
+            Descriptor::U64 => self.option_native(false, ValType::I64),
             Descriptor::F32 => self.option_native(true, ValType::F32),
             Descriptor::F64 => self.option_native(true, ValType::F64),
-            Descriptor::I64 | Descriptor::U64 => {
-                let (signed, ty) = match arg {
-                    Descriptor::I64 => (true, AdapterType::S64.option()),
-                    _ => (false, AdapterType::U64.option()),
-                };
-                self.instruction(
-                    &[AdapterType::I32, AdapterType::I32, AdapterType::I32],
-                    Instruction::Option64FromI32 { signed },
-                    &[ty],
-                );
-            }
             Descriptor::Boolean => {
                 self.instruction(
                     &[AdapterType::I32],
@@ -405,10 +387,9 @@ impl InstructionBuilder<'_, '_> {
                 // check we did not add any deferred calls, because we have undermined the idea of
                 // running them unconditionally in a finally {} block. String does this, but we
                 // special case it.
-                assert!(!self.instructions[len..].iter().any(|idata| matches!(
-                    idata.instr,
-                    Instruction::Standard(wit_walrus::Instruction::DeferCallCore(_))
-                )));
+                assert!(!self.instructions[len..]
+                    .iter()
+                    .any(|idata| matches!(idata.instr, Instruction::DeferFree { .. })));
 
                 // Finally, we add the two inputs to UnwrapResult, and everything checks out
                 //
@@ -447,9 +428,8 @@ impl InstructionBuilder<'_, '_> {
                 // implementation is always safe. We do this in UnwrapResultString's
                 // implementation.
                 let free = self.cx.free()?;
-                let std = wit_walrus::Instruction::DeferCallCore(free);
                 self.instructions.push(InstructionData {
-                    instr: Instruction::Standard(std),
+                    instr: Instruction::DeferFree { free, align: 1 },
                     stack_change: StackChange::Modified {
                         popped: 2,
                         pushed: 2,
@@ -457,9 +437,8 @@ impl InstructionBuilder<'_, '_> {
                 });
 
                 // ... and then convert it to a string type
-                let std = wit_walrus::Instruction::MemoryToString(self.cx.memory()?);
                 self.instructions.push(InstructionData {
-                    instr: Instruction::Standard(std),
+                    instr: Instruction::MemoryToString(self.cx.memory()?),
                     stack_change: StackChange::Modified {
                         popped: 2,
                         pushed: 1,
@@ -525,12 +504,19 @@ impl InstructionBuilder<'_, '_> {
     }
 
     fn outgoing_i32(&mut self, output: AdapterType) {
-        let std = wit_walrus::Instruction::WasmToInt {
+        let instr = Instruction::WasmToInt {
             input: walrus::ValType::I32,
-            output: output.to_wit().unwrap(),
-            trap: false,
+            output: output.clone(),
         };
-        self.instruction(&[AdapterType::I32], Instruction::Standard(std), &[output]);
+        self.instruction(&[AdapterType::I32], instr, &[output]);
+    }
+
+    fn outgoing_i64(&mut self, output: AdapterType) {
+        let instr = Instruction::WasmToInt {
+            input: walrus::ValType::I64,
+            output: output.clone(),
+        };
+        self.instruction(&[AdapterType::I64], instr, &[output]);
     }
 
     fn cached_string(&mut self, optional: bool, owned: bool) -> Result<(), Error> {
@@ -543,6 +529,7 @@ impl InstructionBuilder<'_, '_> {
                 optional,
                 mem,
                 free,
+                table: None,
             },
             &[AdapterType::String],
         );

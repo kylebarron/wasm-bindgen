@@ -44,7 +44,6 @@ impl InstructionBuilder<'_, '_> {
 
     fn _incoming(&mut self, arg: &Descriptor) -> Result<(), Error> {
         use walrus::ValType as WasmVT;
-        use wit_walrus::ValType as WitVT;
         match arg {
             Descriptor::Boolean => {
                 self.instruction(
@@ -83,14 +82,14 @@ impl InstructionBuilder<'_, '_> {
                     &[AdapterType::I32],
                 );
             }
-            Descriptor::I8 => self.number(WitVT::S8, WasmVT::I32),
-            Descriptor::U8 => self.number(WitVT::U8, WasmVT::I32),
-            Descriptor::I16 => self.number(WitVT::S16, WasmVT::I32),
-            Descriptor::U16 => self.number(WitVT::U16, WasmVT::I32),
-            Descriptor::I32 => self.number(WitVT::S32, WasmVT::I32),
-            Descriptor::U32 => self.number(WitVT::U32, WasmVT::I32),
-            Descriptor::I64 => self.number64(true),
-            Descriptor::U64 => self.number64(false),
+            Descriptor::I8 => self.number(AdapterType::S8, WasmVT::I32),
+            Descriptor::U8 => self.number(AdapterType::U8, WasmVT::I32),
+            Descriptor::I16 => self.number(AdapterType::S16, WasmVT::I32),
+            Descriptor::U16 => self.number(AdapterType::U16, WasmVT::I32),
+            Descriptor::I32 => self.number(AdapterType::S32, WasmVT::I32),
+            Descriptor::U32 => self.number(AdapterType::U32, WasmVT::I32),
+            Descriptor::I64 => self.number(AdapterType::S64, WasmVT::I64),
+            Descriptor::U64 => self.number(AdapterType::U64, WasmVT::I64),
             Descriptor::F32 => {
                 self.get(AdapterType::F32);
                 self.output.push(AdapterType::F32);
@@ -99,7 +98,7 @@ impl InstructionBuilder<'_, '_> {
                 self.get(AdapterType::F64);
                 self.output.push(AdapterType::F64);
             }
-            Descriptor::Enum { .. } => self.number(WitVT::U32, WasmVT::I32),
+            Descriptor::Enum { .. } => self.number(AdapterType::U32, WasmVT::I32),
             Descriptor::Ref(d) => self.incoming_ref(false, d)?,
             Descriptor::RefMut(d) => self.incoming_ref(true, d)?,
             Descriptor::Option(d) => self.incoming_option(d)?,
@@ -204,9 +203,13 @@ impl InstructionBuilder<'_, '_> {
                             kind,
                             malloc: self.cx.malloc()?,
                             mem: self.cx.memory()?,
-                            free: self.cx.free()?,
                         },
-                        &[AdapterType::I32, AdapterType::I32],
+                        &[AdapterType::I32, AdapterType::I32, AdapterType::Externref],
+                    );
+                    self.late_instruction(
+                        &[AdapterType::Externref],
+                        Instruction::I32FromExternrefOwned,
+                        &[AdapterType::I32],
                     );
                 } else {
                     self.instruction(
@@ -256,17 +259,7 @@ impl InstructionBuilder<'_, '_> {
             Descriptor::U32 => self.in_option_native(ValType::I32),
             Descriptor::F32 => self.in_option_native(ValType::F32),
             Descriptor::F64 => self.in_option_native(ValType::F64),
-            Descriptor::I64 | Descriptor::U64 => {
-                let (signed, ty) = match arg {
-                    Descriptor::I64 => (true, AdapterType::S64.option()),
-                    _ => (false, AdapterType::U64.option()),
-                };
-                self.instruction(
-                    &[ty],
-                    Instruction::I32SplitOption64 { signed },
-                    &[AdapterType::I32, AdapterType::I32, AdapterType::I32],
-                );
-            }
+            Descriptor::I64 | Descriptor::U64 => self.in_option_native(ValType::I64),
             Descriptor::Boolean => {
                 self.instruction(
                     &[AdapterType::Bool.option()],
@@ -345,9 +338,8 @@ impl InstructionBuilder<'_, '_> {
         // fetch them from the parameters.
         if !self.return_position {
             let idx = self.input.len() as u32 - 1;
-            let std = wit_walrus::Instruction::ArgGet(idx);
             self.instructions.push(InstructionData {
-                instr: Instruction::Standard(std),
+                instr: Instruction::ArgGet(idx),
                 stack_change: StackChange::Modified {
                     pushed: 1,
                     popped: 0,
@@ -383,29 +375,33 @@ impl InstructionBuilder<'_, '_> {
         self.output.extend_from_slice(outputs);
     }
 
-    fn number(&mut self, input: wit_walrus::ValType, output: walrus::ValType) {
-        let std = wit_walrus::Instruction::IntToWasm {
-            input,
-            output,
-            trap: false,
-        };
-        self.instruction(
-            &[AdapterType::from_wit(input)],
-            Instruction::Standard(std),
-            &[AdapterType::from_wasm(output).unwrap()],
-        );
+    /// Add an instruction whose inputs are the results of previous instructions
+    /// instead of the parameters from JS / results from Rust.
+    pub fn late_instruction(
+        &mut self,
+        inputs: &[AdapterType],
+        instr: Instruction,
+        outputs: &[AdapterType],
+    ) {
+        for input in inputs {
+            assert_eq!(self.output.pop().unwrap(), *input);
+        }
+        self.instructions.push(InstructionData {
+            instr,
+            stack_change: StackChange::Modified {
+                popped: inputs.len(),
+                pushed: outputs.len(),
+            },
+        });
+        self.output.extend_from_slice(outputs);
     }
 
-    fn number64(&mut self, signed: bool) {
-        self.instruction(
-            &[if signed {
-                AdapterType::S64
-            } else {
-                AdapterType::U64
-            }],
-            Instruction::I32Split64 { signed },
-            &[AdapterType::I32, AdapterType::I32],
-        );
+    fn number(&mut self, input: AdapterType, output: walrus::ValType) {
+        let instr = Instruction::IntToWasm {
+            input: input.clone(),
+            output,
+        };
+        self.instruction(&[input], instr, &[AdapterType::from_wasm(output).unwrap()]);
     }
 
     fn in_option_native(&mut self, wasm: ValType) {

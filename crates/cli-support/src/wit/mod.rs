@@ -1,3 +1,4 @@
+use crate::decode::LocalModule;
 use crate::descriptor::{Descriptor, Function};
 use crate::descriptors::WasmBindgenDescriptorsSection;
 use crate::intrinsic::Intrinsic;
@@ -8,11 +9,11 @@ use std::str;
 use walrus::MemoryId;
 use walrus::{ExportId, FunctionId, ImportId, Module};
 use wasm_bindgen_shared::struct_function_export_name;
+use wasm_bindgen_threads_xform::ThreadCount;
 
 mod incoming;
 mod nonstandard;
 mod outgoing;
-pub mod section;
 mod standard;
 pub use self::nonstandard::*;
 pub use self::standard::*;
@@ -22,14 +23,18 @@ struct Context<'a> {
     module: &'a mut Module,
     adapters: NonstandardWitSection,
     aux: WasmBindgenAux,
+    /// All of the wasm module's exported functions.
     function_exports: HashMap<String, (ExportId, FunctionId)>,
+    /// All of the wasm module's imported functions.
     function_imports: HashMap<String, (ImportId, FunctionId)>,
+    /// A map from the signature of a function in the function table to its adapter, if we've already created it.
+    table_adapters: HashMap<Function, AdapterId>,
     memory: Option<MemoryId>,
     vendor_prefixes: HashMap<String, Vec<String>>,
     unique_crate_identifier: &'a str,
     descriptors: HashMap<String, Descriptor>,
     externref_enabled: bool,
-    wasm_interface_types: bool,
+    thread_count: Option<ThreadCount>,
     support_start: bool,
 }
 
@@ -43,18 +48,17 @@ struct InstructionBuilder<'a, 'b> {
 
 pub fn process(
     module: &mut Module,
+    programs: Vec<decode::Program>,
     externref_enabled: bool,
-    wasm_interface_types: bool,
+    thread_count: Option<ThreadCount>,
     support_start: bool,
 ) -> Result<(NonstandardWitSectionId, WasmBindgenAuxId), Error> {
-    let mut storage = Vec::new();
-    let programs = extract_programs(module, &mut storage)?;
-
     let mut cx = Context {
         adapters: Default::default(),
         aux: Default::default(),
         function_exports: Default::default(),
         function_imports: Default::default(),
+        table_adapters: Default::default(),
         vendor_prefixes: Default::default(),
         descriptors: Default::default(),
         unique_crate_identifier: "",
@@ -62,7 +66,7 @@ pub fn process(
         module,
         start_found: false,
         externref_enabled,
-        wasm_interface_types,
+        thread_count,
         support_start,
     };
     cx.init()?;
@@ -73,10 +77,6 @@ pub fn process(
 
     if !cx.start_found {
         cx.discover_main()?;
-    }
-
-    if let Some(standard) = cx.module.customs.delete_typed() {
-        cx.standard(&standard)?;
     }
 
     cx.verify()?;
@@ -165,7 +165,7 @@ impl<'a> Context<'a> {
 
             // If any closures exist we need to prevent the function table from
             // getting gc'd
-            if closure_imports.len() > 0 {
+            if !closure_imports.is_empty() {
                 self.aux.function_table = self.module.tables.main_function_table()?;
             }
 
@@ -253,17 +253,29 @@ impl<'a> Context<'a> {
         // find a `main(i32, i32) -> i32`
         let main_id = self
             .module
-            .functions()
-            .find(|x| {
-                use walrus::ValType::I32;
-                // name has to be `main`
-                let name_matches = x.name.as_ref().map_or(false, |x| x == "main");
-                // type has to be `(i32, i32) -> i32`
-                let ty = self.module.types.get(x.ty());
-                let type_matches = ty.params() == [I32, I32] && ty.results() == [I32];
-                name_matches && type_matches
+            .exports
+            .iter()
+            .filter_map(|export| match export.item {
+                walrus::ExportItem::Function(id) => Some((export, self.module.funcs.get(id))),
+                _ => None,
             })
-            .map(|x| x.id());
+            .find(|(export, func)| {
+                use walrus::ValType::I32;
+
+                // name has to be `main`
+                let name_matches = export.name == "main";
+                // type has to be `(i32, i32) -> i32`
+                let ty = self.module.types.get(func.ty());
+                let type_matches = ty.params() == [I32, I32] && ty.results() == [I32];
+                // Having the correct name and signature doesn't necessarily mean that it's
+                // actually a `main` function. Unfortunately, there doesn't seem to be any 100%
+                // reliable way to make sure that it is, but we can at least rule out any
+                // `#[wasm_bindgen]` exported functions.
+                let unknown = !self.adapters.exports.iter().any(|(name, _)| name == "main");
+                name_matches && type_matches && unknown
+            })
+            .map(|(_, func)| func.id());
+
         let main_id = match main_id {
             Some(x) => x,
             None => return Ok(()),
@@ -295,7 +307,7 @@ impl<'a> Context<'a> {
     // since that's a slightly different environment for now which doesn't have
     // quite the same initialization.
     fn inject_externref_initialization(&mut self) -> Result<(), Error> {
-        if !self.externref_enabled || self.wasm_interface_types {
+        if !self.externref_enabled {
             return Ok(());
         }
 
@@ -304,14 +316,13 @@ impl<'a> Context<'a> {
             self.module
                 .add_import_func(PLACEHOLDER_MODULE, "__wbindgen_init_externref_table", ty);
 
-        self.module.start = Some(match self.module.start {
-            Some(prev_start) => {
-                let mut builder = walrus::FunctionBuilder::new(&mut self.module.types, &[], &[]);
-                builder.func_body().call(import).call(prev_start);
-                builder.finish(Vec::new(), &mut self.module.funcs)
-            }
-            None => import,
-        });
+        if self.module.start.is_some() {
+            let builder = wasm_bindgen_wasm_conventions::get_or_insert_start_builder(self.module);
+            builder.func_body().call_at(0, import);
+        } else {
+            self.module.start = Some(import);
+        }
+
         self.bind_intrinsic(import_id, Intrinsic::InitExternrefTable)?;
 
         Ok(())
@@ -328,6 +339,45 @@ impl<'a> Context<'a> {
         Ok(())
     }
 
+    fn link_module(
+        &mut self,
+        id: ImportId,
+        module: &decode::ImportModule,
+        offset: usize,
+        local_modules: &[LocalModule],
+        inline_js: &[&str],
+    ) -> Result<(), Error> {
+        let descriptor = Function {
+            shim_idx: 0,
+            arguments: Vec::new(),
+            ret: Descriptor::String,
+            inner_ret: None,
+        };
+        let id = self.import_adapter(id, descriptor, AdapterJsImportKind::Normal)?;
+        let (path, content) = match module {
+            decode::ImportModule::Named(n) => (
+                format!("snippets/{}", n),
+                local_modules
+                    .iter()
+                    .find(|m| m.identifier == *n)
+                    .map(|m| m.contents),
+            ),
+            decode::ImportModule::RawNamed(n) => (n.to_string(), None),
+            decode::ImportModule::Inline(idx) => (
+                format!(
+                    "snippets/{}/inline{}.js",
+                    self.unique_crate_identifier,
+                    *idx as usize + offset
+                ),
+                Some(inline_js[*idx as usize]),
+            ),
+        };
+        self.aux
+            .import_map
+            .insert(id, AuxImport::LinkTo(path, content.map(str::to_string)));
+        Ok(())
+    }
+
     fn program(&mut self, program: decode::Program<'a>) -> Result<(), Error> {
         self.unique_crate_identifier = program.unique_crate_identifier;
         let decode::Program {
@@ -341,9 +391,10 @@ impl<'a> Context<'a> {
             inline_js,
             unique_crate_identifier,
             package_json,
+            linked_modules,
         } = program;
 
-        for module in local_modules {
+        for module in &local_modules {
             // All local modules we find should be unique, but the same module
             // may have showed up in a few different blocks. If that's the case
             // all the same identifiers should have the same contents.
@@ -362,12 +413,30 @@ impl<'a> Context<'a> {
             self.export(export)?;
         }
 
+        let offset = self
+            .aux
+            .snippets
+            .get(unique_crate_identifier)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        for module in linked_modules {
+            if let Some((id, _)) = self.function_imports.remove(module.link_function_name) {
+                self.link_module(
+                    id,
+                    &module.module,
+                    offset,
+                    &local_modules[..],
+                    &inline_js[..],
+                )?;
+            }
+        }
+
         // Register vendor prefixes for all types before we walk over all the
         // imports to ensure that if a vendor prefix is listed somewhere it'll
         // apply to all the imports.
         for import in imports.iter() {
             if let decode::ImportKind::Type(ty) = &import.kind {
-                if ty.vendor_prefixes.len() == 0 {
+                if ty.vendor_prefixes.is_empty() {
                     continue;
                 }
                 self.vendor_prefixes
@@ -420,36 +489,31 @@ impl<'a> Context<'a> {
                 let class = class.to_string();
                 match export.method_kind {
                     decode::MethodKind::Constructor => AuxExportKind::Constructor(class),
-                    decode::MethodKind::Operation(op) => match op.kind {
-                        decode::OperationKind::Getter(f) => {
+                    decode::MethodKind::Operation(op) => {
+                        if !op.is_static {
+                            // Make the first argument be the index of the receiver.
                             descriptor.arguments.insert(0, Descriptor::I32);
-                            AuxExportKind::Getter {
-                                class,
-                                field: f.to_string(),
-                                consumed: export.consumed,
-                            }
                         }
-                        decode::OperationKind::Setter(f) => {
-                            descriptor.arguments.insert(0, Descriptor::I32);
-                            AuxExportKind::Setter {
-                                class,
-                                field: f.to_string(),
-                                consumed: export.consumed,
-                            }
-                        }
-                        _ if op.is_static => AuxExportKind::StaticFunction {
+
+                        let (name, kind) = match op.kind {
+                            decode::OperationKind::Getter(f) => (f, AuxExportedMethodKind::Getter),
+                            decode::OperationKind::Setter(f) => (f, AuxExportedMethodKind::Setter),
+                            _ => (export.function.name, AuxExportedMethodKind::Method),
+                        };
+
+                        AuxExportKind::Method {
                             class,
-                            name: export.function.name.to_string(),
-                        },
-                        _ => {
-                            descriptor.arguments.insert(0, Descriptor::I32);
-                            AuxExportKind::Method {
-                                class,
-                                name: export.function.name.to_string(),
-                                consumed: export.consumed,
-                            }
+                            name: name.to_owned(),
+                            receiver: if op.is_static {
+                                AuxReceiverKind::None
+                            } else if export.consumed {
+                                AuxReceiverKind::Owned
+                            } else {
+                                AuxReceiverKind::Borrowed
+                            },
+                            kind,
                         }
-                    },
+                    }
                 }
             }
             None => AuxExportKind::Function(export.function.name.to_string()),
@@ -465,6 +529,8 @@ impl<'a> Context<'a> {
                 asyncness: export.function.asyncness,
                 kind,
                 generate_typescript: export.function.generate_typescript,
+                generate_jsdoc: export.function.generate_jsdoc,
+                variadic: export.function.variadic,
             },
         );
         Ok(())
@@ -481,22 +547,21 @@ impl<'a> Context<'a> {
             return Ok(());
         }
 
-        let prev_start = match self.module.start {
-            Some(f) => f,
-            None => {
-                self.module.start = Some(id);
-                return Ok(());
-            }
-        };
+        if let Some(thread_count) = self.thread_count {
+            let builder = wasm_bindgen_wasm_conventions::get_or_insert_start_builder(self.module);
+            thread_count.wrap_start(builder, id);
+        } else if self.module.start.is_some() {
+            let builder = wasm_bindgen_wasm_conventions::get_or_insert_start_builder(self.module);
 
-        // Note that we call the previous start function, if any, first. This is
-        // because the start function currently only shows up when it's injected
-        // through thread/externref transforms. These injected start functions
-        // need to happen before user code, so we always schedule them first.
-        let mut builder = walrus::FunctionBuilder::new(&mut self.module.types, &[], &[]);
-        builder.func_body().call(prev_start).call(id);
-        let new_start = builder.finish(Vec::new(), &mut self.module.funcs);
-        self.module.start = Some(new_start);
+            // Note that we leave the previous start function, if any, first. This is
+            // because the start function currently only shows up when it's injected
+            // through thread/externref transforms. These injected start functions
+            // need to happen before user code, so we always schedule them first.
+            builder.func_body().call(id);
+        } else {
+            self.module.start = Some(id);
+        }
+
         Ok(())
     }
 
@@ -540,7 +605,7 @@ impl<'a> Context<'a> {
         // to the WebAssembly instance.
         let (id, import) = match method {
             Some(data) => {
-                let class = self.determine_import(import, &data.class)?;
+                let class = self.determine_import(import, data.class)?;
                 match &data.kind {
                     // NB: `structural` is ignored for constructors since the
                     // js type isn't expected to change anyway.
@@ -735,7 +800,7 @@ impl<'a> Context<'a> {
 
         // And then save off that this function is is an instanceof shim for an
         // imported item.
-        let import = self.determine_import(import, &static_.name)?;
+        let import = self.determine_import(import, static_.name)?;
         self.aux.import_map.insert(id, AuxImport::Static(import));
         Ok(())
     }
@@ -764,7 +829,7 @@ impl<'a> Context<'a> {
 
         // And then save off that this function is is an instanceof shim for an
         // imported item.
-        let import = self.determine_import(import, &type_.name)?;
+        let import = self.determine_import(import, type_.name)?;
         self.aux
             .import_map
             .insert(id, AuxImport::Instanceof(import));
@@ -794,8 +859,8 @@ impl<'a> Context<'a> {
 
     fn struct_(&mut self, struct_: decode::Struct<'_>) -> Result<(), Error> {
         for field in struct_.fields {
-            let getter = wasm_bindgen_shared::struct_field_get(&struct_.name, &field.name);
-            let setter = wasm_bindgen_shared::struct_field_set(&struct_.name, &field.name);
+            let getter = wasm_bindgen_shared::struct_field_get(struct_.name, field.name);
+            let setter = wasm_bindgen_shared::struct_field_set(struct_.name, field.name);
             let descriptor = match self.descriptors.remove(&getter) {
                 None => continue,
                 Some(d) => d,
@@ -807,7 +872,7 @@ impl<'a> Context<'a> {
                 arguments: vec![Descriptor::I32],
                 shim_idx: 0,
                 ret: descriptor.clone(),
-                inner_ret: None,
+                inner_ret: Some(descriptor.clone()),
             };
             let getter_id = self.export_adapter(getter_id, getter_descriptor)?;
             self.aux.export_map.insert(
@@ -817,12 +882,15 @@ impl<'a> Context<'a> {
                     arg_names: None,
                     asyncness: false,
                     comments: concatenate_comments(&field.comments),
-                    kind: AuxExportKind::Getter {
+                    kind: AuxExportKind::Method {
                         class: struct_.name.to_string(),
-                        field: field.name.to_string(),
-                        consumed: false,
+                        name: field.name.to_string(),
+                        receiver: AuxReceiverKind::Borrowed,
+                        kind: AuxExportedMethodKind::Getter,
                     },
                     generate_typescript: field.generate_typescript,
+                    generate_jsdoc: field.generate_jsdoc,
+                    variadic: false,
                 },
             );
 
@@ -846,12 +914,15 @@ impl<'a> Context<'a> {
                     arg_names: None,
                     asyncness: false,
                     comments: concatenate_comments(&field.comments),
-                    kind: AuxExportKind::Setter {
+                    kind: AuxExportKind::Method {
                         class: struct_.name.to_string(),
-                        field: field.name.to_string(),
-                        consumed: false,
+                        name: field.name.to_string(),
+                        receiver: AuxReceiverKind::Borrowed,
+                        kind: AuxExportedMethodKind::Setter,
                     },
                     generate_typescript: field.generate_typescript,
+                    generate_jsdoc: field.generate_jsdoc,
+                    variadic: false,
                 },
             );
         }
@@ -933,21 +1004,16 @@ impl<'a> Context<'a> {
     }
 
     fn determine_import(&self, import: &decode::Import<'_>, item: &str) -> Result<JsImport, Error> {
-        let is_local_snippet = match import.module {
-            decode::ImportModule::Named(s) => self.aux.local_modules.contains_key(s),
-            decode::ImportModule::RawNamed(_) => false,
-            decode::ImportModule::Inline(_) => true,
-            decode::ImportModule::None => false,
-        };
-
         // Similar to `--target no-modules`, only allow vendor prefixes
         // basically for web apis, shouldn't be necessary for things like npm
         // packages or other imported items.
         let vendor_prefixes = self.vendor_prefixes.get(item);
         if let Some(vendor_prefixes) = vendor_prefixes {
-            assert!(vendor_prefixes.len() > 0);
+            assert!(!vendor_prefixes.is_empty());
 
-            if is_local_snippet {
+            if let Some(decode::ImportModule::Inline(_) | decode::ImportModule::Named(_)) =
+                &import.module
+            {
                 bail!(
                     "local JS snippets do not support vendor prefixes for \
                      the import of `{}` with a polyfill of `{}`",
@@ -955,7 +1021,7 @@ impl<'a> Context<'a> {
                     &vendor_prefixes[0]
                 );
             }
-            if let decode::ImportModule::Named(module) = &import.module {
+            if let Some(decode::ImportModule::RawNamed(module)) = &import.module {
                 bail!(
                     "import of `{}` from `{}` has a polyfill of `{}` listed, but
                      vendor prefixes aren't supported when importing from modules",
@@ -983,7 +1049,7 @@ impl<'a> Context<'a> {
 
         let (name, fields) = match import.js_namespace {
             Some(ref ns) => {
-                let mut tail = (&ns[1..]).to_owned();
+                let mut tail = ns[1..].to_owned();
                 tail.push(item.to_string());
                 (ns[0].to_owned(), tail)
             }
@@ -991,17 +1057,15 @@ impl<'a> Context<'a> {
         };
 
         let name = match import.module {
-            decode::ImportModule::Named(module) if is_local_snippet => JsImportName::LocalModule {
+            Some(decode::ImportModule::Named(module)) => JsImportName::LocalModule {
                 module: module.to_string(),
-                name: name.to_string(),
+                name,
             },
-            decode::ImportModule::Named(module) | decode::ImportModule::RawNamed(module) => {
-                JsImportName::Module {
-                    module: module.to_string(),
-                    name: name.to_string(),
-                }
-            }
-            decode::ImportModule::Inline(idx) => {
+            Some(decode::ImportModule::RawNamed(module)) => JsImportName::Module {
+                module: module.to_string(),
+                name,
+            },
+            Some(decode::ImportModule::Inline(idx)) => {
                 let offset = self
                     .aux
                     .snippets
@@ -1011,148 +1075,12 @@ impl<'a> Context<'a> {
                 JsImportName::InlineJs {
                     unique_crate_identifier: self.unique_crate_identifier.to_string(),
                     snippet_idx_in_crate: idx as usize + offset,
-                    name: name.to_string(),
+                    name,
                 }
             }
-            decode::ImportModule::None => JsImportName::Global {
-                name: name.to_string(),
-            },
+            None => JsImportName::Global { name },
         };
         Ok(JsImport { name, fields })
-    }
-
-    fn standard(&mut self, std: &wit_walrus::WasmInterfaceTypes) -> Result<(), Error> {
-        let mut walrus2us = HashMap::new();
-        let params_and_results = |id: wit_walrus::TypeId| -> (Vec<_>, Vec<_>) {
-            let ty = std.types.get(id);
-            let params = ty
-                .params()
-                .iter()
-                .cloned()
-                .map(AdapterType::from_wit)
-                .collect();
-            let results = ty
-                .results()
-                .iter()
-                .cloned()
-                .map(AdapterType::from_wit)
-                .collect();
-            (params, results)
-        };
-
-        // Register all imports, allocating our own id for them and configuring
-        // where the JS value for the import is coming from.
-        for import in std.imports.iter() {
-            let func = std.funcs.get(import.func);
-            let (params, results) = params_and_results(func.ty);
-            let id = self.adapters.append(
-                params,
-                results,
-                vec![],
-                AdapterKind::Import {
-                    module: import.module.clone(),
-                    name: import.name.clone(),
-                    kind: AdapterJsImportKind::Normal,
-                },
-            );
-            walrus2us.insert(import.func, id);
-            let js = JsImport {
-                name: JsImportName::Module {
-                    module: import.module.clone(),
-                    name: import.name.clone(),
-                },
-                fields: Vec::new(),
-            };
-            let value = AuxValue::Bare(js);
-            assert!(self
-                .aux
-                .import_map
-                .insert(id, AuxImport::Value(value))
-                .is_none());
-        }
-
-        // Register all functions, allocating our own id system for each of the
-        // functions.
-        for func in std.funcs.iter() {
-            if let wit_walrus::FuncKind::Import(_) = func.kind {
-                continue;
-            }
-            let (params, results) = params_and_results(func.ty);
-            walrus2us.insert(
-                func.id(),
-                self.adapters.append(
-                    params,
-                    results,
-                    vec![],
-                    AdapterKind::Local {
-                        instructions: Vec::new(),
-                    },
-                ),
-            );
-        }
-
-        // .. and then actually translate all functions using our id mapping,
-        // now that we're able to remap all the `CallAdapter` instructions.
-        for func in std.funcs.iter() {
-            let instrs = match &func.kind {
-                wit_walrus::FuncKind::Local(instrs) => instrs,
-                wit_walrus::FuncKind::Import(_) => continue,
-            };
-            let instrs = instrs
-                .iter()
-                .map(|i| match i {
-                    wit_walrus::Instruction::CallAdapter(f) => {
-                        Instruction::CallAdapter(walrus2us[&f])
-                    }
-                    other => Instruction::Standard(other.clone()),
-                })
-                .map(|instr| InstructionData {
-                    instr,
-                    stack_change: StackChange::Unknown,
-                })
-                .collect::<Vec<_>>();
-
-            // Store the instrs into the adapter function directly.
-            let adapter = self
-                .adapters
-                .adapters
-                .get_mut(&walrus2us[&func.id()])
-                .unwrap();
-            match &mut adapter.kind {
-                AdapterKind::Local { instructions } => *instructions = instrs,
-                _ => unreachable!(),
-            }
-        }
-
-        // next up register all exports, ensuring that our export map says
-        // what's happening as well for JS
-        for export in std.exports.iter() {
-            let id = walrus2us[&export.func];
-            self.adapters.exports.push((export.name.clone(), id));
-
-            let kind = AuxExportKind::Function(export.name.clone());
-            let export = AuxExport {
-                debug_name: format!("standard export {:?}", id),
-                comments: String::new(),
-                arg_names: None,
-                asyncness: false,
-                kind,
-                generate_typescript: true,
-            };
-            assert!(self.aux.export_map.insert(id, export).is_none());
-        }
-
-        // ... and finally the `implements` section
-        for i in std.implements.iter() {
-            let import_id = match &self.module.funcs.get(i.core_func).kind {
-                walrus::FunctionKind::Import(i) => i.import,
-                _ => panic!("malformed wasm interface typess section"),
-            };
-            self.adapters
-                .implements
-                .push((import_id, i.core_func, walrus2us[&i.adapter_func]));
-        }
-        Ok(())
     }
 
     /// Perform a small verification pass over the module to perform some
@@ -1186,7 +1114,7 @@ impl<'a> Context<'a> {
                 bail!("import of `{}` doesn't have an adapter listed", import.name);
             }
         }
-        if implemented.len() != 0 {
+        if !implemented.is_empty() {
             bail!("more implementations listed than imports");
         }
 
@@ -1334,10 +1262,51 @@ impl<'a> Context<'a> {
         Ok(id)
     }
 
-    fn table_element_adapter(&mut self, idx: u32, signature: Function) -> Result<AdapterId, Error> {
+    fn table_element_adapter(
+        &mut self,
+        idx: u32,
+        mut signature: Function,
+    ) -> Result<AdapterId, Error> {
+        fn strip_externref_names(descriptor: &mut Descriptor) {
+            match descriptor {
+                Descriptor::NamedExternref(_) => *descriptor = Descriptor::Externref,
+
+                Descriptor::Function(function) => strip_function_externref_names(function),
+                Descriptor::Closure(closure) => {
+                    strip_function_externref_names(&mut closure.function)
+                }
+                Descriptor::Ref(descriptor)
+                | Descriptor::RefMut(descriptor)
+                | Descriptor::Slice(descriptor)
+                | Descriptor::Vector(descriptor)
+                | Descriptor::Option(descriptor)
+                | Descriptor::Result(descriptor) => strip_externref_names(descriptor),
+
+                _ => {}
+            }
+        }
+
+        fn strip_function_externref_names(descriptor: &mut Function) {
+            descriptor
+                .arguments
+                .iter_mut()
+                .for_each(strip_externref_names);
+            strip_externref_names(&mut descriptor.ret);
+            descriptor.inner_ret.as_mut().map(strip_externref_names);
+        }
+
+        // We don't care about the names of externrefs here; we only care whether
+        // the compiler will actually keep them as separate functions.
+        strip_function_externref_names(&mut signature);
+
+        if let Some(&id) = self.table_adapters.get(&signature) {
+            return Ok(id);
+        }
         let call = Instruction::CallTableElement(idx);
         // like above, largely just defer the work elsewhere
-        Ok(self.register_export_adapter(call, signature)?)
+        let id = self.register_export_adapter(call, signature.clone())?;
+        self.table_adapters.insert(signature, id);
+        Ok(id)
     }
 
     fn register_export_adapter(
@@ -1511,7 +1480,11 @@ impl<'a> Context<'a> {
     }
 }
 
-fn extract_programs<'a>(
+/// Extract all of the `Program`s encoded in our custom section.
+///
+/// `program_storage` is used to squirrel away the raw bytes of the custom
+///  section, so that they can be referenced by the `Program`s we return.
+pub fn extract_programs<'a>(
     module: &mut Module,
     program_storage: &'a mut Vec<Vec<u8>>,
 ) -> Result<Vec<decode::Program<'a>>, Error> {
@@ -1552,26 +1525,25 @@ fn extract_programs<'a>(
 it looks like the Rust project used to create this wasm file was linked against
 version of wasm-bindgen that uses a different bindgen format than this binary:
 
-  rust wasm file schema version: {}
-     this binary schema version: {}
+  rust wasm file schema version: {their_version}
+     this binary schema version: {my_version}
 
 Currently the bindgen format is unstable enough that these two schema versions
-must exactly match. You can accomplish this by either updating the wasm-bindgen
-dependency or this binary.
+must exactly match. You can accomplish this by either updating this binary or 
+the wasm-bindgen dependency in the Rust project.
 
 You should be able to update the wasm-bindgen dependency with:
 
-    cargo update -p wasm-bindgen
+    cargo update -p wasm-bindgen --precise {my_version}
 
-or you can update the binary with
+don't forget to recompile your wasm file! Alternatively, you can update the 
+binary with:
 
-    cargo install -f wasm-bindgen-cli
+    cargo install -f wasm-bindgen-cli --version {their_version}
 
 if this warning fails to go away though and you're not sure what to do feel free
 to open an issue at https://github.com/rustwasm/wasm-bindgen/issues!
-",
-                    their_version,
-                    my_version,
+"
                 );
             }
             let next = get_remaining(&mut payload).unwrap();
@@ -1583,19 +1555,16 @@ to open an issue at https://github.com/rustwasm/wasm-bindgen/issues!
 }
 
 fn get_remaining<'a>(data: &mut &'a [u8]) -> Option<&'a [u8]> {
-    if data.len() == 0 {
+    if data.is_empty() {
         return None;
     }
-    let len = ((data[0] as usize) << 0)
-        | ((data[1] as usize) << 8)
-        | ((data[2] as usize) << 16)
-        | ((data[3] as usize) << 24);
+    let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
     let (a, b) = data[4..].split_at(len);
     *data = b;
     Some(a)
 }
 
-fn verify_schema_matches<'a>(data: &'a [u8]) -> Result<Option<&'a str>, Error> {
+fn verify_schema_matches(data: &[u8]) -> Result<Option<&str>, Error> {
     macro_rules! bad {
         () => {
             bail!("failed to decode what looked like wasm-bindgen data")
@@ -1606,7 +1575,7 @@ fn verify_schema_matches<'a>(data: &'a [u8]) -> Result<Option<&'a str>, Error> {
         Err(_) => bad!(),
     };
     log::debug!("found version specifier {}", data);
-    if !data.starts_with("{") || !data.ends_with("}") {
+    if !data.starts_with('{') || !data.ends_with('}') {
         bad!()
     }
     let needle = "\"schema_version\":\"";
@@ -1614,7 +1583,7 @@ fn verify_schema_matches<'a>(data: &'a [u8]) -> Result<Option<&'a str>, Error> {
         Some(i) => &data[i + needle.len()..],
         None => bad!(),
     };
-    let their_schema_version = match rest.find("\"") {
+    let their_schema_version = match rest.find('"') {
         Some(i) => &rest[..i],
         None => bad!(),
     };
@@ -1626,7 +1595,7 @@ fn verify_schema_matches<'a>(data: &'a [u8]) -> Result<Option<&'a str>, Error> {
         Some(i) => &data[i + needle.len()..],
         None => bad!(),
     };
-    let their_version = match rest.find("\"") {
+    let their_version = match rest.find('"') {
         Some(i) => &rest[..i],
         None => bad!(),
     };
@@ -1634,7 +1603,7 @@ fn verify_schema_matches<'a>(data: &'a [u8]) -> Result<Option<&'a str>, Error> {
 }
 
 fn concatenate_comments(comments: &[&str]) -> String {
-    comments.iter().map(|&s| s).collect::<Vec<_>>().join("\n")
+    comments.to_vec().join("\n")
 }
 
 /// The C struct packing algorithm, in terms of u32.
@@ -1660,7 +1629,7 @@ impl StructUnpacker {
     fn read_ty(&mut self, ty: &AdapterType) -> Result<usize, Error> {
         let (quads, alignment) = match ty {
             AdapterType::I32 | AdapterType::U32 | AdapterType::F32 => (1, 1),
-            AdapterType::F64 => (2, 2),
+            AdapterType::I64 | AdapterType::U64 | AdapterType::F64 => (2, 2),
             other => bail!("invalid aggregate return type {:?}", other),
         };
         Ok(self.append(quads, alignment))

@@ -1,9 +1,10 @@
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::iter::FromIterator;
 
-lazy_static! {
-    pub(crate) static ref BUILTIN_IDENTS: BTreeSet<&'static str> = BTreeSet::from_iter(vec![
+pub(crate) static BUILTIN_IDENTS: Lazy<BTreeSet<&'static str>> = Lazy::new(|| {
+    BTreeSet::from_iter(vec![
         "str",
         "char",
         "bool",
@@ -31,17 +32,16 @@ lazy_static! {
         "Function",
         "Clamped",
         "DataView",
-    ]);
+        "Iterator",
+    ])
+});
 
+// whitelist a few names that have known polyfills
+pub(crate) static POLYFILL_INTERFACES: Lazy<BTreeSet<&'static str>> =
+    Lazy::new(|| BTreeSet::from_iter(vec!["AudioContext", "OfflineAudioContext"]));
 
-    // whitelist a few names that have known polyfills
-    pub(crate) static ref POLYFILL_INTERFACES: BTreeSet<&'static str> = BTreeSet::from_iter(vec![
-        "AudioContext",
-        "OfflineAudioContext",
-    ]);
-
-
-    pub(crate) static ref IMMUTABLE_SLICE_WHITELIST: BTreeSet<&'static str> = BTreeSet::from_iter(vec![
+pub(crate) static IMMUTABLE_SLICE_WHITELIST: Lazy<BTreeSet<&'static str>> = Lazy::new(|| {
+    BTreeSet::from_iter(vec![
         // ImageData
         "ImageData",
         // WebGlRenderingContext, WebGl2RenderingContext
@@ -89,7 +89,33 @@ lazy_static! {
         "writeBuffer",
         "writeTexture",
         // AudioBuffer
-        "copyToChannel"
-        // TODO: Add another type's functions here. Leave a comment header with the type name
-    ]);
-}
+        "copyToChannel",
+        // FontFace
+        "FontFace", // TODO: Add another type's functions here. Leave a comment header with the type name
+        // FileSystemSyncAccessHandle and FileSystemWritableFileStream
+        "write",
+    ])
+});
+
+pub(crate) static FIXED_INTERFACES: Lazy<BTreeMap<&'static str, &'static str>> = Lazy::new(|| {
+    BTreeMap::from_iter(vec![
+        ("create_image_bitmap_with_html_image_element_and_i32_and_a_sy_and_a_sw_and_a_sh", "create_image_bitmap_with_html_image_element_and_a_sx_and_a_sy_and_a_sw_and_a_sh"),
+        ("create_image_bitmap_with_svg_image_element_and_i32_and_a_sy_and_a_sw_and_a_sh", "create_image_bitmap_with_svg_image_element_and_a_sx_and_a_sy_and_a_sw_and_a_sh"),
+        ("create_image_bitmap_with_html_canvas_element_and_i32_and_a_sy_and_a_sw_and_a_sh", "create_image_bitmap_with_html_canvas_element_and_a_sx_and_a_sy_and_a_sw_and_a_sh"),
+        ("create_image_bitmap_with_html_video_element_and_i32_and_a_sy_and_a_sw_and_a_sh", "create_image_bitmap_with_html_video_element_and_a_sx_and_a_sy_and_a_sw_and_a_sh"),
+        ("create_image_bitmap_with_image_bitmap_and_i32_and_a_sy_and_a_sw_and_a_sh", "create_image_bitmap_with_image_bitmap_and_a_sx_and_a_sy_and_a_sw_and_a_sh"),
+        ("create_image_bitmap_with_offscreen_canvas_and_i32_and_a_sy_and_a_sw_and_a_sh", "create_image_bitmap_with_offscreen_canvas_and_a_sx_and_a_sy_and_a_sw_and_a_sh"),
+        ("create_image_bitmap_with_video_frame_and_i32_and_a_sy_and_a_sw_and_a_sh", "create_image_bitmap_with_video_frame_and_a_sx_and_a_sy_and_a_sw_and_a_sh"),
+        ("create_image_bitmap_with_blob_and_i32_and_a_sy_and_a_sw_and_a_sh", "create_image_bitmap_with_blob_and_a_sx_and_a_sy_and_a_sw_and_a_sh"),
+        ("create_image_bitmap_with_image_data_and_i32_and_a_sy_and_a_sw_and_a_sh", "create_image_bitmap_with_image_data_and_a_sx_and_a_sy_and_a_sw_and_a_sh"),
+        ("create_image_bitmap_with_html_image_element_and_i32_and_a_sy_and_a_sw_and_a_sh_and_a_options", "create_image_bitmap_with_html_image_element_and_a_sx_and_a_sy_and_a_sw_and_a_sh_and_a_options"),
+        ("create_image_bitmap_with_svg_image_element_and_i32_and_a_sy_and_a_sw_and_a_sh_and_a_options", "create_image_bitmap_with_svg_image_element_and_a_sx_and_a_sy_and_a_sw_and_a_sh_and_a_options"),
+        ("create_image_bitmap_with_html_canvas_element_and_i32_and_a_sy_and_a_sw_and_a_sh_and_a_options", "create_image_bitmap_with_html_canvas_element_and_a_sx_and_a_sy_and_a_sw_and_a_sh_and_a_options"),
+        ("create_image_bitmap_with_html_video_element_and_i32_and_a_sy_and_a_sw_and_a_sh_and_a_options", "create_image_bitmap_with_html_video_element_and_a_sx_and_a_sy_and_a_sw_and_a_sh_and_a_options"),
+        ("create_image_bitmap_with_image_bitmap_and_i32_and_a_sy_and_a_sw_and_a_sh_and_a_options", "create_image_bitmap_with_image_bitmap_and_a_sx_and_a_sy_and_a_sw_and_a_sh_and_a_options"),
+        ("create_image_bitmap_with_offscreen_canvas_and_i32_and_a_sy_and_a_sw_and_a_sh_and_a_options", "create_image_bitmap_with_offscreen_canvas_and_a_sx_and_a_sy_and_a_sw_and_a_sh_and_a_options"),
+        ("create_image_bitmap_with_video_frame_and_i32_and_a_sy_and_a_sw_and_a_sh_and_a_options", "create_image_bitmap_with_video_frame_and_a_sx_and_a_sy_and_a_sw_and_a_sh_and_a_options"),
+        ("create_image_bitmap_with_blob_and_i32_and_a_sy_and_a_sw_and_a_sh_and_a_options", "create_image_bitmap_with_blob_and_a_sx_and_a_sy_and_a_sw_and_a_sh_and_a_options"),
+        ("create_image_bitmap_with_image_data_and_i32_and_a_sy_and_a_sw_and_a_sh_and_a_options", "create_image_bitmap_with_image_data_and_a_sx_and_a_sy_and_a_sw_and_a_sh_and_a_options"),
+    ])
+});

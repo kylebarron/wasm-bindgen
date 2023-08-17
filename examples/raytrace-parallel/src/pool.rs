@@ -8,7 +8,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
 use web_sys::{ErrorEvent, Event, Worker};
 
@@ -43,10 +42,10 @@ impl WorkerPool {
         let pool = WorkerPool {
             state: Rc::new(PoolState {
                 workers: RefCell::new(Vec::with_capacity(initial)),
-                callback: Closure::wrap(Box::new(|event: Event| {
+                callback: Closure::new(|event: Event| {
                     console_log!("unhandled event: {}", event.type_());
                     crate::logv(&event);
-                }) as Box<dyn FnMut(Event)>),
+                }),
             }),
         };
         for _ in 0..initial {
@@ -145,7 +144,7 @@ impl WorkerPool {
         let worker2 = worker.clone();
         let reclaim_slot = Rc::new(RefCell::new(None));
         let slot2 = reclaim_slot.clone();
-        let reclaim = Closure::wrap(Box::new(move |event: Event| {
+        let reclaim = Closure::<dyn FnMut(_)>::new(move |event: Event| {
             if let Some(error) = event.dyn_ref::<ErrorEvent>() {
                 console_log!("error in worker: {}", error.message());
                 // TODO: this probably leaks memory somehow? It's sort of
@@ -166,7 +165,7 @@ impl WorkerPool {
             console_log!("unhandled event: {}", event.type_());
             crate::logv(&event);
             // TODO: like above, maybe a memory leak here?
-        }) as Box<dyn FnMut(Event)>);
+        });
         worker.set_onmessage(Some(reclaim.as_ref().unchecked_ref()));
         *reclaim_slot.borrow_mut() = Some(reclaim);
     }

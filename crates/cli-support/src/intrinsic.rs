@@ -51,15 +51,6 @@ macro_rules! intrinsics {
                     )*
                 }
             }
-
-            /// Returns the symbol name of this intrinsic
-            pub fn name(&self) -> &'static str {
-                match self {
-                    $(
-                        Intrinsic::$name => $sym,
-                    )*
-                }
-            }
         }
     };
 }
@@ -80,6 +71,14 @@ fn opt_f64() -> Descriptor {
     Descriptor::Option(Box::new(Descriptor::F64))
 }
 
+fn opt_i64() -> Descriptor {
+    Descriptor::Option(Box::new(Descriptor::I64))
+}
+
+fn slice(contents: Descriptor) -> Descriptor {
+    Descriptor::Ref(Box::new(Descriptor::Slice(Box::new(contents))))
+}
+
 intrinsics! {
     pub enum Intrinsic {
         #[symbol = "__wbindgen_jsval_eq"]
@@ -91,6 +90,9 @@ intrinsics! {
         #[symbol = "__wbindgen_is_function"]
         #[signature = fn(ref_externref()) -> Boolean]
         IsFunction,
+        #[symbol = "__wbindgen_is_array"]
+        #[signature = fn(ref_externref()) -> Boolean]
+        IsArray,
         #[symbol = "__wbindgen_is_undefined"]
         #[signature = fn(ref_externref()) -> Boolean]
         IsUndefined,
@@ -193,9 +195,24 @@ intrinsics! {
         #[symbol = "__wbindgen_number_new"]
         #[signature = fn(F64) -> Externref]
         NumberNew,
-        #[symbol = "__wbindgen_bigint_new"]
+        #[symbol = "__wbindgen_bigint_from_str"]
         #[signature = fn(ref_string()) -> Externref]
-        BigIntNew,
+        BigIntFromStr,
+        #[symbol = "__wbindgen_bigint_from_i64"]
+        #[signature = fn(I64) -> Externref]
+        BigIntFromI64,
+        #[symbol = "__wbindgen_bigint_from_u64"]
+        #[signature = fn(U64) -> Externref]
+        BigIntFromU64,
+        #[symbol = "__wbindgen_bigint_from_i128"]
+        #[signature = fn(I64, U64) -> Externref]
+        BigIntFromI128,
+        #[symbol = "__wbindgen_bigint_from_u128"]
+        #[signature = fn(U64, U64) -> Externref]
+        BigIntFromU128,
+        #[symbol = "__wbindgen_bigint_get_as_i64"]
+        #[signature = fn(ref_externref()) -> opt_i64()]
+        BigIntGetAsI64,
         #[symbol = "__wbindgen_string_new"]
         #[signature = fn(ref_string()) -> Externref]
         StringNew,
@@ -226,6 +243,9 @@ intrinsics! {
         #[symbol = "__wbindgen_memory"]
         #[signature = fn() -> Externref]
         Memory,
+        #[symbol = "__wbindgen_exports"]
+        #[signature = fn() -> Externref]
+        Exports,
         #[symbol = "__wbindgen_module"]
         #[signature = fn() -> Externref]
         Module,
@@ -241,6 +261,9 @@ intrinsics! {
         #[symbol = "__wbindgen_json_serialize"]
         #[signature = fn(ref_externref()) -> String]
         JsonSerialize,
+        #[symbol = "__wbindgen_copy_to_typed_array"]
+        #[signature = fn(slice(U8), ref_externref()) -> Unit]
+        CopyToTypedArray,
         #[symbol = "__wbindgen_externref_heap_live_count"]
         #[signature = fn() -> I32]
         ExternrefHeapLiveCount,

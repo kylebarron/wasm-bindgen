@@ -4,9 +4,9 @@
 //! closures" from Rust to JS. Some more details can be found on the `Closure`
 //! type itself.
 
+#![allow(clippy::fn_to_numeric_cast)]
+
 use std::fmt;
-#[cfg(feature = "nightly")]
-use std::marker::Unsize;
 use std::mem::{self, ManuallyDrop};
 use std::prelude::v1::*;
 
@@ -31,9 +31,7 @@ use crate::UnwrapThrowExt;
 ///
 /// The type parameter on `Closure` is the type of closure that this represents.
 /// Currently this can only be the `Fn` and `FnMut` traits with up to 7
-/// arguments (and an optional return value). The arguments/return value of the
-/// trait must be numbers like `u32` for now, although this restriction may be
-/// lifted in the future!
+/// arguments (and an optional return value).
 ///
 /// # Examples
 ///
@@ -69,11 +67,11 @@ use crate::UnwrapThrowExt;
 ///
 /// #[wasm_bindgen]
 /// pub fn run() -> IntervalHandle {
-///     // First up we use `Closure::wrap` to wrap up a Rust closure and create
+///     // First up we use `Closure::new` to wrap up a Rust closure and create
 ///     // a JS closure.
-///     let cb = Closure::wrap(Box::new(|| {
+///     let cb = Closure::new(|| {
 ///         log("interval elapsed!");
-///     }) as Box<dyn FnMut()>);
+///     });
 ///
 ///     // Next we pass this via reference to the `setInterval` function, and
 ///     // `setInterval` gets a handle to the corresponding JS closure.
@@ -113,9 +111,9 @@ use crate::UnwrapThrowExt;
 ///
 /// #[wasm_bindgen]
 /// pub fn run() -> Result<IntervalHandle, JsValue> {
-///     let cb = Closure::wrap(Box::new(|| {
+///     let cb = Closure::new(|| {
 ///         web_sys::console::log_1(&"interval elapsed!".into());
-///     }) as Box<dyn FnMut()>);
+///     });
 ///
 ///     let window = web_sys::window().unwrap();
 ///     let interval_id = window.set_interval_with_callback_and_timeout_and_arguments_0(
@@ -254,24 +252,9 @@ impl<T> Closure<T>
 where
     T: ?Sized + WasmClosure,
 {
-    /// A more ergonomic version of `Closure::wrap` that does the boxing and
-    /// cast to trait object for you.
+    /// Creates a new instance of `Closure` from the provided Rust function.
     ///
-    /// *This method requires the `nightly` feature of the `wasm-bindgen` crate
-    /// to be enabled, meaning this is a nightly-only API. Users on stable
-    /// should use `Closure::wrap`.*
-    #[cfg(feature = "nightly")]
-    pub fn new<F>(t: F) -> Closure<T>
-    where
-        F: Unsize<T> + 'static,
-    {
-        Closure::wrap(Box::new(t) as Box<T>)
-    }
-
-    /// Creates a new instance of `Closure` from the provided boxed Rust
-    /// function.
-    ///
-    /// Note that the closure provided here, `Box<T>`, has a few requirements
+    /// Note that the closure provided here, `F`, has a few requirements
     /// associated with it:
     ///
     /// * It must implement `Fn` or `FnMut` (for `FnOnce` functions see
@@ -285,6 +268,15 @@ where
     /// * Its arguments and return values are all types that can be shared with
     ///   JS (i.e. have `#[wasm_bindgen]` annotations or are simple numbers,
     ///   etc.)
+    pub fn new<F>(t: F) -> Closure<T>
+    where
+        F: IntoWasmClosure<T> + 'static,
+    {
+        Closure::wrap(Box::new(t).unsize())
+    }
+
+    /// A more direct version of `Closure::new` which creates a `Closure` from
+    /// a `Box<dyn Fn>`/`Box<dyn FnMut>`, which is how it's kept internally.
     pub fn wrap(mut data: Box<T>) -> Closure<T> {
         assert_eq!(mem::size_of::<*const T>(), mem::size_of::<FatPtr<T>>());
         let (a, b) = unsafe {
@@ -436,7 +428,6 @@ impl Closure<dyn FnOnce()> {
     /// and everything it closes over will leak.
     ///
     /// ```rust,ignore
-    /// use js_sys;
     /// use wasm_bindgen::{prelude::*, JsCast};
     ///
     /// let f = Closure::once_into_js(move || {
@@ -543,6 +534,15 @@ pub unsafe trait WasmClosure {
     fn describe();
 }
 
+/// An internal trait for the `Closure` type.
+///
+/// This trait is not stable and it's not recommended to use this in bounds or
+/// implement yourself.
+#[doc(hidden)]
+pub trait IntoWasmClosure<T: ?Sized> {
+    fn unsize(self: Box<Self>) -> Box<T>;
+}
+
 // The memory safety here in these implementations below is a bit tricky. We
 // want to be able to drop the `Closure` object from within the invocation of a
 // `Closure` for cases like promises. That means that while it's running we
@@ -573,7 +573,7 @@ macro_rules! doit {
                     $($var: <$var as FromWasmAbi>::Abi),*
                 ) -> <R as ReturnWasmAbi>::Abi {
                     if a == 0 {
-                        throw_str("closure invoked recursively or destroyed already");
+                        throw_str("closure invoked after being dropped");
                     }
                     // Make sure all stack variables are converted before we
                     // convert `ret` as it may throw (for `Result`, for
@@ -625,7 +625,7 @@ macro_rules! doit {
                     $($var: <$var as FromWasmAbi>::Abi),*
                 ) -> <R as ReturnWasmAbi>::Abi {
                     if a == 0 {
-                        throw_str("closure invoked recursively or destroyed already");
+                        throw_str("closure invoked recursively or after being dropped");
                     }
                     // Make sure all stack variables are converted before we
                     // convert `ret` as it may throw (for `Result`, for
@@ -711,6 +711,22 @@ macro_rules! doit {
                 js_val
             }
         }
+
+        impl<T, $($var,)* R> IntoWasmClosure<dyn FnMut($($var),*) -> R> for T
+            where T: 'static + FnMut($($var),*) -> R,
+                  $($var: FromWasmAbi + 'static,)*
+                  R: ReturnWasmAbi + 'static,
+        {
+            fn unsize(self: Box<Self>) -> Box<dyn FnMut($($var),*) -> R> { self }
+        }
+
+        impl<T, $($var,)* R> IntoWasmClosure<dyn Fn($($var),*) -> R> for T
+            where T: 'static + Fn($($var),*) -> R,
+                  $($var: FromWasmAbi + 'static,)*
+                  R: ReturnWasmAbi + 'static,
+        {
+            fn unsize(self: Box<Self>) -> Box<dyn Fn($($var),*) -> R> { self }
+        }
     )*)
 }
 
@@ -745,7 +761,7 @@ where
             arg: <A as RefFromWasmAbi>::Abi,
         ) -> <R as ReturnWasmAbi>::Abi {
             if a == 0 {
-                throw_str("closure invoked recursively or destroyed already");
+                throw_str("closure invoked after being dropped");
             }
             // Make sure all stack variables are converted before we
             // convert `ret` as it may throw (for `Result`, for
@@ -788,7 +804,7 @@ where
             arg: <A as RefFromWasmAbi>::Abi,
         ) -> <R as ReturnWasmAbi>::Abi {
             if a == 0 {
-                throw_str("closure invoked recursively or destroyed already");
+                throw_str("closure invoked recursively or after being dropped");
             }
             // Make sure all stack variables are converted before we
             // convert `ret` as it may throw (for `Result`, for

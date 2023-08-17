@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 use web_sys::{console, HtmlElement, HtmlInputElement, MessageEvent, Worker};
 
 /// A number evaluation struct
@@ -29,10 +28,7 @@ impl NumberEval {
     /// * `number` - The number to be checked for being even/odd.
     pub fn is_even(&mut self, number: i32) -> bool {
         self.number = number;
-        match self.number % 2 {
-            0 => true,
-            _ => false,
-        }
+        self.number % 2 == 0
     }
 
     /// Get last number that was checked - this method is added to work with
@@ -50,10 +46,10 @@ pub fn startup() {
     // `Rc<RefCell>` following the interior mutability pattern. Here, it would
     // not be needed but we include the wrapping anyway as example.
     let worker_handle = Rc::new(RefCell::new(Worker::new("./worker.js").unwrap()));
-    console::log_1(&"Created a new worker from within WASM".into());
+    console::log_1(&"Created a new worker from within Wasm".into());
 
     // Pass the worker to the function which sets up the `oninput` callback.
-    setup_input_oninput_callback(worker_handle.clone());
+    setup_input_oninput_callback(worker_handle);
 }
 
 fn setup_input_oninput_callback(worker: Rc<RefCell<web_sys::Worker>>) {
@@ -68,7 +64,7 @@ fn setup_input_oninput_callback(worker: Rc<RefCell<web_sys::Worker>>) {
     #[allow(unused_assignments)]
     let mut persistent_callback_handle = get_on_msg_callback();
 
-    let callback = Closure::wrap(Box::new(move || {
+    let callback = Closure::new(move || {
         console::log_1(&"oninput callback triggered".into());
         let document = web_sys::window().unwrap().document().unwrap();
 
@@ -103,7 +99,7 @@ fn setup_input_oninput_callback(worker: Rc<RefCell<web_sys::Worker>>) {
                     .set_inner_text("");
             }
         }
-    }) as Box<dyn FnMut()>);
+    });
 
     // Attach the closure as `oninput` callback to the input field.
     document
@@ -119,8 +115,8 @@ fn setup_input_oninput_callback(worker: Rc<RefCell<web_sys::Worker>>) {
 
 /// Create a closure to act on the message returned by the worker
 fn get_on_msg_callback() -> Closure<dyn FnMut(MessageEvent)> {
-    let callback = Closure::wrap(Box::new(move |event: MessageEvent| {
-        console::log_2(&"Received response: ".into(), &event.data().into());
+    Closure::new(move |event: MessageEvent| {
+        console::log_2(&"Received response: ".into(), &event.data());
 
         let result = match event.data().as_bool().unwrap() {
             true => "even",
@@ -134,7 +130,5 @@ fn get_on_msg_callback() -> Closure<dyn FnMut(MessageEvent)> {
             .dyn_ref::<HtmlElement>()
             .expect("#resultField should be a HtmlInputElement")
             .set_inner_text(result);
-    }) as Box<dyn FnMut(_)>);
-
-    callback
+    })
 }

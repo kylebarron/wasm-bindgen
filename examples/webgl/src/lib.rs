@@ -1,9 +1,8 @@
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 use web_sys::{WebGl2RenderingContext, WebGlProgram, WebGlShader};
 
 #[wasm_bindgen(start)]
-pub fn start() -> Result<(), JsValue> {
+fn start() -> Result<(), JsValue> {
     let document = web_sys::window().unwrap().document().unwrap();
     let canvas = document.get_element_by_id("canvas").unwrap();
     let canvas: web_sys::HtmlCanvasElement = canvas.dyn_into::<web_sys::HtmlCanvasElement>()?;
@@ -72,7 +71,14 @@ pub fn start() -> Result<(), JsValue> {
         .ok_or("Could not create vertex array object")?;
     context.bind_vertex_array(Some(&vao));
 
-    context.vertex_attrib_pointer_with_i32(0, 3, WebGl2RenderingContext::FLOAT, false, 0, 0);
+    context.vertex_attrib_pointer_with_i32(
+        position_attribute_location as u32,
+        3,
+        WebGl2RenderingContext::FLOAT,
+        false,
+        0,
+        0,
+    );
     context.enable_vertex_attrib_array(position_attribute_location as u32);
 
     context.bind_vertex_array(Some(&vao));

@@ -1,3 +1,5 @@
+#![allow(clippy::fn_to_numeric_cast)]
+
 use core::mem;
 
 use crate::convert::slices::WasmSlice;
@@ -29,7 +31,7 @@ macro_rules! stack_closures {
             $($var: <$var as FromWasmAbi>::Abi),*
         ) -> <R as ReturnWasmAbi>::Abi {
             if a == 0 {
-                throw_str("closure invoked recursively or destroyed already");
+                throw_str("closure invoked after being dropped");
             }
             // Scope all local variables before we call `return_abi` to
             // ensure they're all destroyed as `return_abi` may throw
@@ -78,7 +80,7 @@ macro_rules! stack_closures {
             $($var: <$var as FromWasmAbi>::Abi),*
         ) -> <R as ReturnWasmAbi>::Abi {
             if a == 0 {
-                throw_str("closure invoked recursively or destroyed already");
+                throw_str("closure invoked recursively or after being dropped");
             }
             // Scope all local variables before we call `return_abi` to
             // ensure they're all destroyed as `return_abi` may throw
@@ -145,7 +147,7 @@ unsafe extern "C" fn invoke1_ref<A: RefFromWasmAbi, R: ReturnWasmAbi>(
     arg: <A as RefFromWasmAbi>::Abi,
 ) -> <R as ReturnWasmAbi>::Abi {
     if a == 0 {
-        throw_str("closure invoked recursively or destroyed already");
+        throw_str("closure invoked after being dropped");
     }
     // Scope all local variables before we call `return_abi` to
     // ensure they're all destroyed as `return_abi` may throw
@@ -197,7 +199,7 @@ unsafe extern "C" fn invoke1_mut_ref<A: RefFromWasmAbi, R: ReturnWasmAbi>(
     arg: <A as RefFromWasmAbi>::Abi,
 ) -> <R as ReturnWasmAbi>::Abi {
     if a == 0 {
-        throw_str("closure invoked recursively or destroyed already");
+        throw_str("closure invoked recursively or after being dropped");
     }
     // Scope all local variables before we call `return_abi` to
     // ensure they're all destroyed as `return_abi` may throw

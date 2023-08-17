@@ -19,8 +19,8 @@ mod util;
 use crate::first_pass::{CallbackInterfaceData, OperationData};
 use crate::first_pass::{FirstPass, FirstPassRecord, InterfaceData, OperationId};
 use crate::generator::{
-    Dictionary, DictionaryField, Enum, EnumVariant, Function, Interface, InterfaceAttribute,
-    InterfaceAttributeKind, InterfaceConst, InterfaceMethod, Namespace,
+    Const, Dictionary, DictionaryField, Enum, EnumVariant, Function, Interface, InterfaceAttribute,
+    InterfaceAttributeKind, InterfaceMethod, Namespace,
 };
 use crate::idl_type::ToIdlType;
 use crate::traverse::TraverseType;
@@ -35,10 +35,10 @@ use quote::ToTokens;
 use sourcefile::SourceFile;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsStr;
-use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::{fmt, iter};
 use wasm_bindgen_backend::util::rust_ident;
 use weedle::attribute::ExtendedAttributeList;
 use weedle::common::Identifier;
@@ -254,7 +254,7 @@ impl<'src> FirstPassRecord<'src> {
             .iter()
             .map(|v| {
                 let name = if !v.0.is_empty() {
-                    rust_ident(camel_case_ident(&v.0).as_str())
+                    rust_ident(camel_case_ident(v.0).as_str())
                 } else {
                     rust_ident("None")
                 };
@@ -335,8 +335,14 @@ impl<'src> FirstPassRecord<'src> {
         // > comprise their identifiers.
         let start = dst.len();
         let members = definition.members.body.iter();
-        let partials = dict_data.partials.iter().flat_map(|d| &d.members.body);
-        for member in members.chain(partials) {
+        let partials = dict_data.partials.iter().flat_map(|d| {
+            d.definition
+                .members
+                .body
+                .iter()
+                .zip(iter::repeat(unstable || d.stability.is_unstable()))
+        });
+        for (member, unstable) in members.zip(iter::repeat(unstable)).chain(partials) {
             match self.dictionary_field(member, unstable, unstable_types) {
                 Some(f) => dst.push(f),
                 None => {
@@ -356,7 +362,7 @@ impl<'src> FirstPassRecord<'src> {
         }
         dst[start..].sort_by_key(|f| f.js_name.clone());
 
-        return true;
+        true
     }
 
     fn dictionary_field(
@@ -380,10 +386,7 @@ impl<'src> FirstPassRecord<'src> {
         // Slice types aren't supported because they don't implement
         // `Into<JsValue>`
         match ty {
-            syn::Type::Reference(ref i) => match &*i.elem {
-                syn::Type::Slice(_) => return None,
-                _ => (),
-            },
+            syn::Type::Reference(ref i) if matches!(&*i.elem, syn::Type::Slice(_)) => return None,
             syn::Type::Path(ref path, ..) =>
             // check that our inner don't contains slices either
             {
@@ -391,9 +394,8 @@ impl<'src> FirstPassRecord<'src> {
                     if let syn::PathArguments::AngleBracketed(ref arg) = seg.arguments {
                         for elem in &arg.args {
                             if let syn::GenericArgument::Type(syn::Type::Reference(ref i)) = elem {
-                                match &*i.elem {
-                                    syn::Type::Slice(_) => return None,
-                                    _ => (),
+                                if matches!(&*i.elem, syn::Type::Slice(_)) {
+                                    return None;
                                 }
                             }
                         }
@@ -408,10 +410,8 @@ impl<'src> FirstPassRecord<'src> {
         let mut any_64bit = false;
 
         ty.traverse_type(&mut |ident| {
-            if !any_64bit {
-                if ident == "u64" || ident == "i64" {
-                    any_64bit = true;
-                }
+            if !any_64bit && (ident == "u64" || ident == "i64") {
+                any_64bit = true;
             }
         });
 
@@ -436,24 +436,55 @@ impl<'src> FirstPassRecord<'src> {
         js_name: String,
         ns: &'src first_pass::NamespaceData<'src>,
     ) {
+        let unstable = ns.stability.is_unstable();
+
+        let mut consts = vec![];
         let mut functions = vec![];
 
-        for (id, data) in ns.operations.iter() {
-            self.append_ns_member(&mut functions, &js_name, id, data);
+        for member in ns.consts.iter() {
+            self.append_ns_const(&mut consts, member.clone(), unstable);
         }
 
-        if !functions.is_empty() {
+        for (id, data) in ns.operations.iter() {
+            self.append_ns_operation(&mut functions, &js_name, id, data);
+        }
+
+        if !consts.is_empty() || !functions.is_empty() {
             Namespace {
                 name,
                 js_name,
+                consts,
                 functions,
+                unstable,
             }
             .generate(options)
             .to_tokens(&mut program.tokens);
         }
     }
 
-    fn append_ns_member(
+    fn append_ns_const(
+        &self,
+        consts: &mut Vec<Const>,
+        member: first_pass::ConstNamespaceData<'src>,
+        unstable: bool,
+    ) {
+        let idl_type = member.definition.const_type.to_idl_type(self);
+        let ty = idl_type.to_syn_type(TypePosition::Return).unwrap().unwrap();
+
+        let js_name = member.definition.identifier.0;
+        let name = rust_ident(shouty_snake_case_ident(js_name).as_str());
+        let value = webidl_const_v_to_backend_const_v(&member.definition.const_value);
+
+        consts.push(Const {
+            name,
+            js_name: js_name.to_string(),
+            ty,
+            value,
+            unstable: unstable || member.stability.is_unstable(),
+        });
+    }
+
+    fn append_ns_operation(
         &self,
         functions: &mut Vec<Function>,
         js_name: &'src str,
@@ -486,9 +517,9 @@ impl<'src> FirstPassRecord<'src> {
         }
     }
 
-    fn append_const(
+    fn append_interface_const(
         &self,
-        consts: &mut Vec<InterfaceConst>,
+        consts: &mut Vec<Const>,
         member: &'src weedle::interface::ConstMember<'src>,
         unstable: bool,
     ) {
@@ -499,7 +530,7 @@ impl<'src> FirstPassRecord<'src> {
         let name = rust_ident(shouty_snake_case_ident(js_name).as_str());
         let value = webidl_const_v_to_backend_const_v(&member.const_value);
 
-        consts.push(InterfaceConst {
+        consts.push(Const {
             name,
             js_name: js_name.to_string(),
             ty,
@@ -536,7 +567,9 @@ impl<'src> FirstPassRecord<'src> {
         let mut methods = vec![];
 
         for member in data.consts.iter() {
-            self.append_const(&mut consts, member, unstable);
+            let unstable = unstable || member.stability.is_unstable();
+            let member = member.definition;
+            self.append_interface_const(&mut consts, member, unstable);
         }
 
         for member in data.attributes.iter() {
@@ -560,7 +593,7 @@ impl<'src> FirstPassRecord<'src> {
 
         for mixin_data in self.all_mixins(&js_name) {
             for member in &mixin_data.consts {
-                self.append_const(&mut consts, member, unstable);
+                self.append_interface_const(&mut consts, member, unstable);
             }
 
             for member in &mixin_data.attributes {
@@ -568,11 +601,9 @@ impl<'src> FirstPassRecord<'src> {
                 let member = member.definition;
                 self.member_attribute(
                     &mut attributes,
-                    if let Some(s) = member.stringifier {
-                        Some(weedle::interface::StringifierOrInheritOrStatic::Stringifier(s))
-                    } else {
-                        None
-                    },
+                    member
+                        .stringifier
+                        .map(weedle::interface::StringifierOrInheritOrStatic::Stringifier),
                     member.readonly.is_some(),
                     &member.type_,
                     member.identifier.0.to_string(),
@@ -755,17 +786,15 @@ pub fn generate(from: &Path, to: &Path, options: Options) -> Result<String> {
     let features = parse_webidl(generate_features, source, unstable_source)?;
 
     if to.exists() {
-        fs::remove_dir_all(&to).context("Removing features directory")?;
+        fs::remove_dir_all(to).context("Removing features directory")?;
     }
 
-    fs::create_dir_all(&to).context("Creating features directory")?;
+    fs::create_dir_all(to).context("Creating features directory")?;
 
     for (name, feature) in features.iter() {
         let out_file_path = to.join(format!("gen_{}.rs", name));
 
         fs::write(&out_file_path, &feature.code)?;
-
-        rustfmt(&out_file_path, name)?;
     }
 
     let binding_file = features.keys().map(|name| {
@@ -778,7 +807,12 @@ pub fn generate(from: &Path, to: &Path, options: Options) -> Result<String> {
 
     fs::write(to.join("mod.rs"), binding_file)?;
 
-    rustfmt(&to.join("mod.rs"), "mod")?;
+    let to_format = features
+        .keys()
+        .map(|name| to.join(format!("gen_{}.rs", name)))
+        .chain([to.join("mod.rs")]);
+
+    rustfmt(to_format)?;
 
     return if generate_features {
         let features = features
@@ -815,16 +849,16 @@ pub fn generate(from: &Path, to: &Path, options: Options) -> Result<String> {
         Ok(source)
     }
 
-    fn rustfmt(path: &PathBuf, name: &str) -> Result<()> {
+    fn rustfmt(paths: impl IntoIterator<Item = PathBuf>) -> Result<()> {
         // run rustfmt on the generated file - really handy for debugging
         let result = Command::new("rustfmt")
             .arg("--edition")
             .arg("2018")
-            .arg(&path)
+            .args(paths)
             .status()
-            .context(format!("rustfmt on file {}", name))?;
+            .context("rustfmt failed")?;
 
-        assert!(result.success(), "rustfmt on file {}", name);
+        assert!(result.success(), "rustfmt failed");
 
         Ok(())
     }
@@ -855,7 +889,7 @@ pub fn generate(from: &Path, to: &Path, options: Options) -> Result<String> {
                         return Err(e.context("compiling WebIDL into wasm-bindgen bindings"));
                     }
                 }
-                return Err(e.context("compiling WebIDL into wasm-bindgen bindings"));
+                Err(e.context("compiling WebIDL into wasm-bindgen bindings"))
             }
         }
     }

@@ -62,7 +62,7 @@ fn maybe_unstable_docs(unstable: bool) -> Option<proc_macro2::TokenStream> {
 
 fn generate_arguments(arguments: &[(Ident, Type)], variadic: bool) -> Vec<TokenStream> {
     arguments
-        .into_iter()
+        .iter()
         .enumerate()
         .map(|(i, (name, ty))| {
             if variadic && i + 1 == arguments.len() {
@@ -118,12 +118,13 @@ impl Enum {
         );
 
         let variants = variants
-            .into_iter()
+            .iter()
             .map(|variant| variant.generate())
             .collect::<Vec<_>>();
 
         quote! {
             #![allow(unused_imports)]
+            #![allow(clippy::all)]
             use wasm_bindgen::prelude::*;
 
             #unstable_attr
@@ -134,6 +135,82 @@ impl Enum {
             pub enum #name {
                 #(#variants),*
             }
+        }
+    }
+}
+
+pub enum ConstValue {
+    Boolean(bool),
+    Float(f64),
+    SignedInteger(i64),
+    UnsignedInteger(u64),
+}
+
+impl ConstValue {
+    fn generate(&self) -> TokenStream {
+        use ConstValue::*;
+
+        match self {
+            Boolean(false) => quote!(false),
+            Boolean(true) => quote!(true),
+            // the actual type is unknown because of typedefs
+            // so we cannot use std::fxx::INFINITY
+            // but we can use type inference
+            Float(f) if f.is_infinite() && f.is_sign_positive() => quote!(1.0 / 0.0),
+            Float(f) if f.is_infinite() && f.is_sign_negative() => quote!(-1.0 / 0.0),
+            Float(f) if f.is_nan() => quote!(0.0 / 0.0),
+            // again no suffix
+            // panics on +-inf, nan
+            Float(f) => {
+                let f = Literal::f64_suffixed(*f);
+                quote!(#f)
+            }
+            SignedInteger(i) => {
+                let i = Literal::i64_suffixed(*i);
+                quote!(#i)
+            }
+            UnsignedInteger(i) => {
+                let i = Literal::u64_suffixed(*i);
+                quote!(#i)
+            }
+        }
+    }
+}
+
+pub struct Const {
+    pub name: Ident,
+    pub js_name: String,
+    pub ty: syn::Type,
+    pub value: ConstValue,
+    pub unstable: bool,
+}
+
+impl Const {
+    fn generate(
+        &self,
+        options: &Options,
+        parent_name: &Ident,
+        parent_js_name: &str,
+    ) -> TokenStream {
+        let name = &self.name;
+        let ty = &self.ty;
+        let js_name = &self.js_name;
+        let value = self.value.generate();
+        let unstable = self.unstable;
+
+        let unstable_attr = maybe_unstable_attr(unstable);
+        let unstable_docs = maybe_unstable_docs(unstable);
+
+        let doc_comment = comment(
+            format!("The `{}.{}` const.", parent_js_name, js_name),
+            &get_features_doc(options, parent_name.to_string()),
+        );
+
+        quote! {
+            #unstable_attr
+            #doc_comment
+            #unstable_docs
+            pub const #name: #ty = #value as #ty;
         }
     }
 }
@@ -344,15 +421,15 @@ impl InterfaceMethod {
             }
             InterfaceMethodKind::IndexingGetter => {
                 extra_args.push(quote!(indexing_getter));
-                format!("Indexing getter.\n\n")
+                "Indexing getter. As in the literal Javascript `this[key]`.\n\n".to_string()
             }
             InterfaceMethodKind::IndexingSetter => {
                 extra_args.push(quote!(indexing_setter));
-                format!("Indexing setter.\n\n")
+                "Indexing setter. As in the literal Javascript `this[key] = value`.\n\n".to_string()
             }
             InterfaceMethodKind::IndexingDeleter => {
                 extra_args.push(quote!(indexing_deleter));
-                format!("Indexing deleter.\n\n")
+                "Indexing deleter. As in the literal Javascript `delete this[key]`.\n\n".to_string()
             }
         };
 
@@ -429,89 +506,13 @@ impl InterfaceMethod {
     }
 }
 
-pub enum InterfaceConstValue {
-    BooleanLiteral(bool),
-    FloatLiteral(f64),
-    SignedIntegerLiteral(i64),
-    UnsignedIntegerLiteral(u64),
-}
-
-impl InterfaceConstValue {
-    fn generate(&self) -> TokenStream {
-        use InterfaceConstValue::*;
-
-        match self {
-            BooleanLiteral(false) => quote!(false),
-            BooleanLiteral(true) => quote!(true),
-            // the actual type is unknown because of typedefs
-            // so we cannot use std::fxx::INFINITY
-            // but we can use type inference
-            FloatLiteral(f) if f.is_infinite() && f.is_sign_positive() => quote!(1.0 / 0.0),
-            FloatLiteral(f) if f.is_infinite() && f.is_sign_negative() => quote!(-1.0 / 0.0),
-            FloatLiteral(f) if f.is_nan() => quote!(0.0 / 0.0),
-            // again no suffix
-            // panics on +-inf, nan
-            FloatLiteral(f) => {
-                let f = Literal::f64_suffixed(*f);
-                quote!(#f)
-            }
-            SignedIntegerLiteral(i) => {
-                let i = Literal::i64_suffixed(*i);
-                quote!(#i)
-            }
-            UnsignedIntegerLiteral(i) => {
-                let i = Literal::u64_suffixed(*i);
-                quote!(#i)
-            }
-        }
-    }
-}
-
-pub struct InterfaceConst {
-    pub name: Ident,
-    pub js_name: String,
-    pub ty: syn::Type,
-    pub value: InterfaceConstValue,
-    pub unstable: bool,
-}
-
-impl InterfaceConst {
-    fn generate(
-        &self,
-        options: &Options,
-        parent_name: &Ident,
-        parent_js_name: &str,
-    ) -> TokenStream {
-        let name = &self.name;
-        let ty = &self.ty;
-        let js_name = &self.js_name;
-        let value = self.value.generate();
-        let unstable = self.unstable;
-
-        let unstable_attr = maybe_unstable_attr(unstable);
-        let unstable_docs = maybe_unstable_docs(unstable);
-
-        let doc_comment = comment(
-            format!("The `{}.{}` const.", parent_js_name, js_name),
-            &get_features_doc(options, parent_name.to_string()),
-        );
-
-        quote! {
-            #unstable_attr
-            #doc_comment
-            #unstable_docs
-            pub const #name: #ty = #value as #ty;
-        }
-    }
-}
-
 pub struct Interface {
     pub name: Ident,
     pub js_name: String,
     pub deprecated: Option<String>,
     pub has_interface: bool,
     pub parents: Vec<Ident>,
-    pub consts: Vec<InterfaceConst>,
+    pub consts: Vec<Const>,
     pub attributes: Vec<InterfaceAttribute>,
     pub methods: Vec<InterfaceMethod>,
     pub unstable: bool,
@@ -556,13 +557,13 @@ impl Interface {
         };
 
         let extends = parents
-            .into_iter()
+            .iter()
             .map(|x| quote!( extends = #x, ))
             .collect::<Vec<_>>();
 
         let consts = consts
-            .into_iter()
-            .map(|x| x.generate(options, &name, js_name))
+            .iter()
+            .map(|x| x.generate(options, name, js_name))
             .collect::<Vec<_>>();
 
         let consts = if consts.is_empty() {
@@ -577,19 +578,20 @@ impl Interface {
         };
 
         let attributes = attributes
-            .into_iter()
-            .map(|x| x.generate(options, &name, js_name, &parents))
+            .iter()
+            .map(|x| x.generate(options, name, js_name, parents))
             .collect::<Vec<_>>();
 
         let methods = methods
-            .into_iter()
-            .map(|x| x.generate(options, &name, js_name.to_string(), &parents))
+            .iter()
+            .map(|x| x.generate(options, name, js_name.to_string(), parents))
             .collect::<Vec<_>>();
 
         let js_ident = raw_ident(js_name);
 
         quote! {
             #![allow(unused_imports)]
+            #![allow(clippy::all)]
             use super::*;
             use wasm_bindgen::prelude::*;
 
@@ -710,15 +712,6 @@ impl Dictionary {
             }
         }
 
-        // The constructor is unstable if any of the fields are
-        let (unstable_ctor, unstable_ctor_docs) = match unstable {
-            true => (None, None),
-            false => {
-                let unstable = fields.iter().any(|f| f.unstable);
-                (maybe_unstable_attr(unstable), maybe_unstable_docs(unstable))
-            }
-        };
-
         required_features.remove(&name.to_string());
 
         let cfg_features = get_cfg_features(options, &required_features);
@@ -735,12 +728,13 @@ impl Dictionary {
         );
 
         let fields = fields
-            .into_iter()
+            .iter()
             .map(|field| field.generate_rust(options, name.to_string()))
             .collect::<Vec<_>>();
 
         let mut base_stream = quote! {
             #![allow(unused_imports)]
+            #![allow(clippy::all)]
             use super::*;
             use wasm_bindgen::prelude::*;
 
@@ -756,11 +750,9 @@ impl Dictionary {
 
             #unstable_attr
             impl #name {
-                #unstable_ctor
                 #cfg_features
                 #ctor_doc_comment
                 #unstable_docs
-                #unstable_ctor_docs
                 pub fn new(#(#required_args),*) -> Self {
                     #[allow(unused_mut)]
                     let mut ret: Self = ::wasm_bindgen::JsCast::unchecked_into(::js_sys::Object::new());
@@ -825,7 +817,7 @@ impl Function {
             "The `{}.{}()` function.\n\n{}",
             parent_js_name,
             js_name,
-            mdn_doc(&parent_js_name, Some(&js_name))
+            mdn_doc(&parent_js_name, Some(js_name))
         );
 
         let mut features = BTreeSet::new();
@@ -883,7 +875,9 @@ impl Function {
 pub struct Namespace {
     pub name: Ident,
     pub js_name: String,
+    pub consts: Vec<Const>,
     pub functions: Vec<Function>,
+    pub unstable: bool,
 }
 
 impl Namespace {
@@ -891,24 +885,47 @@ impl Namespace {
         let Namespace {
             name,
             js_name,
+            consts,
             functions,
+            unstable,
         } = self;
 
+        let unstable_attr = maybe_unstable_attr(*unstable);
+        let unstable_docs = maybe_unstable_docs(*unstable);
+
         let functions = functions
-            .into_iter()
-            .map(|x| x.generate(options, &name, js_name.to_string()))
+            .iter()
+            .map(|x| x.generate(options, name, js_name.to_string()))
             .collect::<Vec<_>>();
 
-        quote! {
-            pub mod #name {
-                #![allow(unused_imports)]
-                use super::super::*;
-                use wasm_bindgen::prelude::*;
-
+        let functions = if functions.is_empty() {
+            None
+        } else {
+            Some(quote! {
                 #[wasm_bindgen]
                 extern "C" {
                     #(#functions)*
                 }
+            })
+        };
+
+        let consts = consts
+            .iter()
+            .map(|x| x.generate(options, name, js_name))
+            .collect::<Vec<_>>();
+
+        quote! {
+            #unstable_attr
+            #unstable_docs
+            pub mod #name {
+                #![allow(unused_imports)]
+                #![allow(clippy::all)]
+                use super::super::*;
+                use wasm_bindgen::prelude::*;
+
+                #(#consts)*
+
+                #functions
             }
         }
     }

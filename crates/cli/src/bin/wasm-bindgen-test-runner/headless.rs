@@ -1,6 +1,5 @@
 use crate::shell::Shell;
 use anyhow::{bail, format_err, Context, Error};
-use curl::easy::{Easy, List};
 use log::{debug, warn};
 use rouille::url::Url;
 use serde::{Deserialize, Serialize};
@@ -13,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use ureq::Agent;
 
 /// Options that can use to customize and configure a WebDriver session.
 type Capabilities = Map<String, Json>;
@@ -69,9 +69,8 @@ pub fn run(server: &SocketAddr, shell: &Shell, timeout: u64) -> Result<(), Error
             // Spawn the driver binary, collecting its stdout/stderr in separate
             // threads. We'll print this output later.
             let mut cmd = Command::new(path);
-            cmd.args(args)
-                .arg(format!("--port={}", driver_addr.port().to_string()));
-            let mut child = BackgroundChild::spawn(&path, &mut cmd, shell)?;
+            cmd.args(args).arg(format!("--port={}", driver_addr.port()));
+            let mut child = BackgroundChild::spawn(path, &mut cmd, shell)?;
             drop_log = Box::new(move || child.print_stdio_on_drop = false);
 
             // Wait for the driver to come online and bind its port before we try to
@@ -80,7 +79,7 @@ pub fn run(server: &SocketAddr, shell: &Shell, timeout: u64) -> Result<(), Error
             let max = Duration::new(5, 0);
             let mut bound = false;
             while start.elapsed() < max {
-                if TcpStream::connect(&driver_addr).is_ok() {
+                if TcpStream::connect(driver_addr).is_ok() {
                     bound = true;
                     break;
                 }
@@ -99,7 +98,7 @@ pub fn run(server: &SocketAddr, shell: &Shell, timeout: u64) -> Result<(), Error
     );
 
     let mut client = Client {
-        handle: Easy::new(),
+        agent: Agent::new(),
         driver_url,
         session: None,
     };
@@ -171,14 +170,14 @@ pub fn run(server: &SocketAddr, shell: &Shell, timeout: u64) -> Result<(), Error
         drop_log();
     } else {
         println!("Failed to detect test as having been run. It might have timed out.");
-        if output.len() > 0 {
+        if !output.is_empty() {
             println!("output div contained:\n{}", tab(&output));
         }
     }
-    if logs.len() > 0 {
+    if !logs.is_empty() {
         println!("console.log div contained:\n{}", tab(&logs));
     }
-    if errors.len() > 0 {
+    if !errors.is_empty() {
         println!("console.log div contained:\n{}", tab(&errors));
     }
 
@@ -193,6 +192,7 @@ enum Driver {
     Gecko(Locate),
     Safari(Locate),
     Chrome(Locate),
+    Edge(Locate),
 }
 
 enum Locate {
@@ -225,6 +225,7 @@ impl Driver {
             ("geckodriver", Driver::Gecko as fn(Locate) -> Driver),
             ("safaridriver", Driver::Safari as fn(Locate) -> Driver),
             ("chromedriver", Driver::Chrome as fn(Locate) -> Driver),
+            ("msedgedriver", Driver::Edge as fn(Locate) -> Driver),
         ];
 
         // First up, if env vars like GECKODRIVER_REMOTE are present, use those
@@ -278,11 +279,12 @@ environment variables like `GECKODRIVER=/path/to/geckodriver` or make sure that
 the binary is in `PATH`; to configure the address of remote webdriver you can
 use environment variables like `GECKODRIVER_REMOTE=http://remote.host/`
 
-This crate currently supports `geckodriver`, `chromedriver`, and `safaridriver`,
-although more driver support may be added! You can download these at:
+This crate currently supports `geckodriver`, `chromedriver`, `safaridriver`, and
+`msedgedriver`, although more driver support may be added! You can download these at:
 
     * geckodriver - https://github.com/mozilla/geckodriver/releases
-    * chromedriver - http://chromedriver.chromium.org/downloads
+    * chromedriver - https://chromedriver.chromium.org/downloads
+    * msedgedriver - https://developer.microsoft.com/en-us/microsoft-edge/tools/webdriver/
     * safaridriver - should be preinstalled on OSX
 
 If you would prefer to not use headless testing and would instead like to do
@@ -301,6 +303,7 @@ an issue against rustwasm/wasm-bindgen!
             Driver::Gecko(_) => "Firefox",
             Driver::Safari(_) => "Safari",
             Driver::Chrome(_) => "Chrome",
+            Driver::Edge(_) => "Edge",
         }
     }
 
@@ -309,12 +312,13 @@ an issue against rustwasm/wasm-bindgen!
             Driver::Gecko(locate) => locate,
             Driver::Safari(locate) => locate,
             Driver::Chrome(locate) => locate,
+            Driver::Edge(locate) => locate,
         }
     }
 }
 
 struct Client {
-    handle: Easy,
+    agent: Agent,
     driver_url: Url,
     session: Option<String>,
 }
@@ -421,14 +425,42 @@ impl Client {
                 let x: Response = self.post("/session", &request)?;
                 Ok(x.session_id)
             }
+            Driver::Edge(_) => {
+                #[derive(Deserialize)]
+                struct Response {
+                    #[serde(rename = "sessionId")]
+                    session_id: String,
+                }
+                cap.entry("ms:edgeOptions".to_string())
+                    .or_insert_with(|| Json::Object(serde_json::Map::new()))
+                    .as_object_mut()
+                    .expect("ms:edgeOptions wasn't a JSON object")
+                    .entry("args".to_string())
+                    .or_insert_with(|| Json::Array(vec![]))
+                    .as_array_mut()
+                    .expect("args wasn't a JSON array")
+                    .extend(vec![
+                        Json::String("headless".to_string()),
+                        // See https://stackoverflow.com/questions/50642308/
+                        // for what this funky `disable-dev-shm-usage`
+                        // option is
+                        Json::String("disable-dev-shm-usage".to_string()),
+                        Json::String("no-sandbox".to_string()),
+                    ]);
+                let request = LegacyNewSessionParameters {
+                    desired: cap,
+                    required: Capabilities::new(),
+                };
+                let x: Response = self.post("/session", &request)?;
+                Ok(x.session_id)
+            }
         }
     }
 
     fn close_window(&mut self, id: &str) -> Result<(), Error> {
         #[derive(Deserialize)]
         struct Response {}
-        let x: Response = self.delete(&format!("/session/{}/window", id))?;
-        drop(x);
+        let _: Response = self.delete(&format!("/session/{}/window", id))?;
         Ok(())
     }
 
@@ -443,8 +475,7 @@ impl Client {
         let request = Request {
             url: url.to_string(),
         };
-        let x: Response = self.post(&format!("/session/{}/url", id), &request)?;
-        drop(x);
+        let _: Response = self.post(&format!("/session/{}/url", id), &request)?;
         Ok(())
     }
 
@@ -471,10 +502,10 @@ impl Client {
             value: selector.to_string(),
         };
         let x: Response = self.post(&format!("/session/{}/element", id), &request)?;
-        Ok(x.value
+        x.value
             .gecko_reference
             .or(x.value.safari_reference)
-            .ok_or(format_err!("failed to find element reference in response"))?)
+            .ok_or(format_err!("failed to find element reference in response"))
     }
 
     fn text(&mut self, id: &str, element: &str) -> Result<String, Error> {
@@ -517,37 +548,24 @@ impl Client {
 
     fn doit(&mut self, path: &str, method: Method) -> Result<String, Error> {
         let url = self.driver_url.join(path)?;
-        self.handle.reset();
-        self.handle.url(url.as_str())?;
-        match method {
-            Method::Post(data) => {
-                self.handle.post(true)?;
-                self.handle
-                    .http_headers(build_headers(&["Content-Type: application/json"]))?;
-                self.handle.post_fields_copy(data.as_bytes())?;
-            }
-            Method::Delete => self.handle.custom_request("DELETE")?,
-            Method::Get => self.handle.get(true)?,
-        }
-        let mut result = Vec::new();
-        {
-            let mut t = self.handle.transfer();
-            t.write_function(|buf| {
-                result.extend_from_slice(buf);
-                Ok(buf.len())
-            })?;
-            t.perform()?
-        }
-        let result = String::from_utf8_lossy(&result);
-        if self.handle.response_code()? != 200 {
-            bail!(
-                "non-200 response code: {}\n{}",
-                self.handle.response_code()?,
-                result
-            );
+        let response = match method {
+            Method::Post(data) => self
+                .agent
+                .post(url.as_str())
+                .set("Content-Type", "application/json")
+                .send_bytes(data.as_bytes())?,
+            Method::Delete => self.agent.delete(url.as_str()).call()?,
+            Method::Get => self.agent.get(url.as_str()).call()?,
+        };
+
+        let response_code = response.status();
+        let result = response.into_string()?;
+
+        if response_code != 200 {
+            bail!("non-200 response code: {}\n{}", response_code, result);
         }
         debug!("got: {}", result);
-        Ok(result.into_owned())
+        Ok(result)
     }
 }
 
@@ -563,14 +581,6 @@ impl Drop for Client {
     }
 }
 
-fn build_headers(headers: &[&str]) -> List {
-    let mut list = List::new();
-    for header in headers {
-        list.append(header).unwrap();
-    }
-    list
-}
-
 fn read<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut dst = Vec::new();
     r.read_to_end(&mut dst)?;
@@ -582,9 +592,9 @@ fn tab(s: &str) -> String {
     for line in s.lines() {
         result.push_str("    ");
         result.push_str(line);
-        result.push_str("\n");
+        result.push('\n');
     }
-    return result;
+    result
 }
 
 struct BackgroundChild<'a> {
@@ -634,11 +644,11 @@ impl<'a> Drop for BackgroundChild<'a> {
         println!("driver status: {}", status);
 
         let stdout = self.stdout.take().unwrap().join().unwrap().unwrap();
-        if stdout.len() > 0 {
+        if !stdout.is_empty() {
             println!("driver stdout:\n{}", tab(&String::from_utf8_lossy(&stdout)));
         }
         let stderr = self.stderr.take().unwrap().join().unwrap().unwrap();
-        if stderr.len() > 0 {
+        if !stderr.is_empty() {
             println!("driver stderr:\n{}", tab(&String::from_utf8_lossy(&stderr)));
         }
     }
